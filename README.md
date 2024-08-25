@@ -1,6 +1,16 @@
  ## 添加依赖
  yum install -y gcc gmp-devel  mpfr-devel  boost-devel libxml2 libxml2-devel
 
+
+## 使用install.sh  自动安装
+```
+  unzip postgis-install-main.zip
+ cd postgis-install-main/
+ chmod +x install.sh
+#以下参数必须被指定到正确的路径上
+./install.sh -i /usr/local -s /usr/local/sqlite -p /home/postgres/pg/bin -c /usr/local/lib/pkgconfig
+```
+## 自定义安装(推荐)
 ## 安装cmake 
 ```
 tar -zxvf CMake-3.30.2.tar.gz 
