@@ -1,6 +1,12 @@
 #!/bin/bash
 
-# 使用命令行参数设置变量
+# 默认值
+INSTALL_DIR=""
+SQLITE_DIR=""
+PG_BIN_DIR=""
+PKG_CONFIG_PATH=""
+
+# 解析命令行参数
 while getopts "i:s:p:c:" opt; do
   case ${opt} in
     i )
@@ -16,18 +22,22 @@ while getopts "i:s:p:c:" opt; do
       PKG_CONFIG_PATH=$OPTARG
       ;;
     \? )
-      echo "Usage: cmd [-i geos的安装路径] [-s SQLITE3安装路径] [-p PG的bin路劲] [-c $SQLITE3/lib/pkgconfig的路径]"
+      echo "Usage: $0 -i INSTALL_DIR -s SQLITE_DIR -p PG_BIN_DIR -c PKG_CONFIG_PATH"
       exit 1
       ;;
   esac
 done
 shift $((OPTIND -1))
 
-# 如果没有提供路径，则使用默认值
-INSTALL_DIR="${INSTALL_DIR:-/usr/local}"
-SQLITE_DIR="${SQLITE_DIR:-$INSTALL_DIR/sqlite}"
-PG_BIN_DIR="${PG_BIN_DIR:-/home/postgres/pg/bin}"
-PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-$INSTALL_DIR/lib/pkgconfig}"
+# 检查是否所有必需的变量都已设置
+if [ -z "$INSTALL_DIR" ] || [ -z "$SQLITE_DIR" ] || [ -z "$PG_BIN_DIR" ] || [ -z "$PKG_CONFIG_PATH" ]; then
+  echo "错误：必须指定所有以下参数："
+  echo "  -i INSTALL_DIR"
+  echo "  -s SQLITE_DIR"
+  echo "  -p PG_BIN_DIR"
+  echo "  -c PKG_CONFIG_PATH"
+  exit 1
+fi
 
 # 显示进度条的函数
 progress_bar() {
