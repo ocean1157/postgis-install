@@ -149,21 +149,23 @@ make install
 ```
 chown -R postgres:postgres /home/postgres/pg/lib 
 ```
-
+shell 脚本只安装步骤仅到此，以下步骤需要手工执行
  
 ## 重启数据库
 ```
 pg_ctl restart
 psql -c "create extension postgis ;"
+
 ```
 ## 可以使用动态库添加方式添加，无需重启数据
 ```
- vim /etc/ld.so.conf
-#### 添加一下内容
-/usr/local/lib
-/usr/local/lib64
+echo "/usr/local/lib" | sudo tee -a /etc/ld.so.conf
+echo "/usr/local/lib64" | sudo tee -a /etc/ld.so.conf
+sudo ldconfig
+chown -R postgres:postgres /home/postgres/pg/lib 
+sudo ldconfig
 ```
- 执行 ldconfig
+ 
 
  #### 创建extension
  ```
