@@ -1,8 +1,8 @@
 # PostGIS installer for PostgreSQL 17 + Patroni
 
-本项目用于在 `postgresql17-ha-patroni-etcd` 已安装并正常运行的 EL7/EL8
-集群节点上，从源码安装 PostGIS 及其依赖。脚本复用现有 PostgreSQL 17 的
-路径、用户和环境，不安装或替换 PostgreSQL。
+本项目用于在 `postgresql17-ha-patroni-etcd` 已安装好的 PostgreSQL 节点上安装
+PostGIS 3.4.2。脚本只操作当前节点，不包含 SSH、SCP 或集群分发逻辑；需要在哪个
+PostgreSQL 节点安装，就在哪个节点直接执行 `install.sh`。
 
 ## 目录
 
@@ -11,67 +11,75 @@ postgis-install/
 ├── install.sh
 ├── README.md
 ├── postgis安装手册.sql
-└── packages/               # 所有离线源码依赖包
+└── packages/               # yum 版本不足时使用的离线源码包
 ```
+
+## 依赖选择规则
+
+脚本按照 PostGIS 3.4 官方要求检查已启用的 yum 仓库：
+
+| 依赖 | 最低版本 | 选择规则 |
+|---|---:|---|
+| GEOS | 3.6 | 仓库版本满足时用 `geos-devel` |
+| PROJ | 6.1 | 仓库版本满足时用 `proj-devel` |
+| LibXML2 | 2.5 | 使用满足要求的系统 RPM |
+| JSON-C | 0.9 | 使用满足要求的系统 RPM |
+| GDAL | 2.0 | 3.x 更佳；仓库版本不足时源码编译 |
+| SFCGAL | 1.3.1 | 1.4.1+ 可使用全部 SFCGAL 功能 |
+| protobuf-c | 1.1.0 | 仓库版本不足时同时编译 protobuf |
+| LLVM | 6.0 | 仅 PostgreSQL 启用 JIT 时需要 |
+
+`PCRE` 用于 Address Standardizer。`CMake`、`SQLite`、`CGAL` 和 `protobuf`
+是源码回退链所需的构建依赖。yum 仓库没有满足版本的 RPM 时，脚本自动使用
+`packages/`，因此 EL7 的旧仓库不会被误用；EL8 仓库版本满足时可减少源码编译。
 
 ## 使用
 
-PostGIS 的动态库必须存在于每个 PostgreSQL 节点。将本项目放到每个节点，
-依次以 root 执行：
+先做预检，查看 PostgreSQL 路径和 yum 候选版本：
 
 ```bash
 chmod +x install.sh
-sudo ./install.sh
-```
-
-脚本会自动：
-
-1. 识别 EL7/EL8；
-2. 找到 `postgresql17-ha-patroni-etcd` 安装的 PostgreSQL 17 `pg_config`；
-3. 从 `packages/` 编译依赖和 PostGIS；
-4. 把扩展安装进现有 PostgreSQL 17 的 `pkglibdir` 和 `sharedir`；
-5. 执行 `ldconfig`；
-6. 仅在 Patroni Leader 上创建/升级 `postgis` 扩展，Replica 跳过 SQL。
-
-建议先做快速检查：
-
-```bash
 sudo ./install.sh --check
 ```
 
-如自动识别不到 PostgreSQL，可显式指定：
+在当前节点执行安装：
+
+```bash
+sudo ./install.sh
+```
+
+完全不使用 yum 中的 GIS 依赖、强制采用 `packages/`：
+
+```bash
+sudo ./install.sh --source-only
+```
+
+如果未自动找到 PostgreSQL 17：
 
 ```bash
 sudo ./install.sh --pg-config /home/postgres/pghome/bin/pg_config
 ```
 
-指定业务数据库：
+默认自动判断当前节点是否为 Patroni Leader。Leader 会在 `postgres` 数据库创建或
+升级扩展，Replica 只安装动态库和扩展 SQL 文件。也可以显式控制：
 
 ```bash
-sudo ./install.sh --database mydb
-```
-
-查看全部参数：
-
-```bash
-./install.sh --help
+sudo ./install.sh --database mydb --create-extension
+sudo ./install.sh --no-create-extension
 ```
 
 ## 验证
-
-在 Leader 上：
-
-```bash
-sudo -u postgres /home/postgres/pg/bin/psql -d postgres \
-  -c "SELECT postgis_full_version();"
-```
-
-在所有节点确认扩展文件使用同一个 PostgreSQL 17 安装目录：
 
 ```bash
 PG_CONFIG=/home/postgres/pghome/bin/pg_config
 test -f "$("$PG_CONFIG" --pkglibdir)/postgis-3.so"
 test -f "$("$PG_CONFIG" --sharedir)/extension/postgis.control"
+ldd "$("$PG_CONFIG" --pkglibdir)/postgis-3.so" | grep 'not found' && exit 1 || true
 ```
 
-注意：源码安装会耗时较长。默认使用全部 CPU，可通过 `JOBS=4` 限制并行度。
+在已创建扩展的可写数据库中：
+
+```bash
+sudo -u postgres /home/postgres/pghome/bin/psql -d postgres \
+  -c "SELECT postgis_full_version();"
+```
