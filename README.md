@@ -35,6 +35,25 @@ postgis-install/
 
 ## 使用
 
+在一台与目标节点相同 EL 大版本、相同 CPU 架构且能够访问 yum 仓库的机器上，
+可以先下载当前仓库可提供的完整 RPM 依赖闭包：
+
+```bash
+sudo bash downloadrpm.sh --check
+sudo bash downloadrpm.sh
+```
+
+下载结果按系统和架构隔离保存：
+
+```text
+packages/rpm/el7/x86_64/
+packages/rpm/el8/x86_64/
+```
+
+脚本会递归下载依赖，生成 `SHA256SUMS` 和环境清单。GIS RPM 只有达到 PostGIS
+3.4 最低版本才会下载；仓库版本过低或不存在时，`install.sh` 继续使用
+`packages/` 中对应的源码包。
+
 先做预检，查看 PostgreSQL 路径和 yum 候选版本：
 
 ```bash
