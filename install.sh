@@ -1,97 +1,328 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# 使用命令行参数设置变量
-while getopts "i:s:p:c:" opt; do
-  case ${opt} in
-    i )
-      INSTALL_DIR=$OPTARG
-      ;;
-    s )
-      SQLITE_DIR=$OPTARG
-      ;;
-    p )
-      PG_BIN_DIR=$OPTARG
-      ;;
-    c )
-      PKG_CONFIG_PATH=$OPTARG
-      ;;
-    \? )
-      echo "Usage: cmd [-i geos的安装路径] [-s SQLITE3安装路径] [-p PG的bin路劲] [-c $SQLITE3/lib/pkgconfig的路径]"
-      exit 1
-      ;;
-  esac
+# PostGIS source installer for PostgreSQL 17 clusters managed by Patroni.
+# Run this script as root on every PostgreSQL node. It detects the PostgreSQL
+# installation produced by postgresql17-ha-patroni-etcd and never replaces it.
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly PACKAGES_DIR="${PACKAGES_DIR:-${SCRIPT_DIR}/packages}"
+
+INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+SQLITE_PREFIX="${SQLITE_PREFIX:-${INSTALL_PREFIX}/sqlite}"
+PG_CONFIG="${PG_CONFIG:-}"
+JOBS="${JOBS:-}"
+CREATE_EXTENSION="${CREATE_EXTENSION:-auto}"
+KEEP_BUILD="${KEEP_BUILD:-0}"
+CHECK_ONLY=0
+
+usage() {
+    cat <<'EOF'
+Usage: sudo ./install.sh [options]
+
+Installs PostGIS against the existing PostgreSQL 17/Patroni installation.
+Run it on every PostgreSQL node; on the Patroni leader it also creates the
+postgis extension in the target database by default.
+
+Options:
+  -i, --prefix DIR          Dependency installation prefix (default: /usr/local)
+  -s, --sqlite-prefix DIR   SQLite installation prefix (default: PREFIX/sqlite)
+  -p, --pg-config FILE      Existing PostgreSQL 17 pg_config path
+  -d, --database NAME       Database used for CREATE EXTENSION (default: postgres)
+      --create-extension    Always create the extension (must run on leader)
+      --no-create-extension Do not create the extension
+      --check               Validate OS, packages and PostgreSQL paths only
+  -j, --jobs N              Parallel build jobs
+  -h, --help                Show this help
+
+Environment overrides: PG_CONFIG, PGHOME, PGBIN, PGPORT, PGDATABASE,
+INSTALL_PREFIX, SQLITE_PREFIX, PACKAGES_DIR, JOBS, CREATE_EXTENSION.
+EOF
+}
+
+log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+while (($#)); do
+    case "$1" in
+        -i|--prefix) INSTALL_PREFIX="$2"; shift 2 ;;
+        -s|--sqlite-prefix) SQLITE_PREFIX="$2"; shift 2 ;;
+        -p|--pg-config)
+            PG_CONFIG="$2"
+            [[ "$PG_CONFIG" == */pg_config ]] || PG_CONFIG="${PG_CONFIG%/}/pg_config"
+            shift 2
+            ;;
+        -d|--database) PGDATABASE="$2"; shift 2 ;;
+        -j|--jobs) JOBS="$2"; shift 2 ;;
+        --create-extension) CREATE_EXTENSION=always; shift ;;
+        --no-create-extension) CREATE_EXTENSION=never; shift ;;
+        --check) CHECK_ONLY=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "Unknown option: $1 (use --help)" ;;
+    esac
 done
-shift $((OPTIND -1))
 
-# 如果没有提供路径，则使用默认值
-INSTALL_DIR="${INSTALL_DIR:-/usr/local}"
-SQLITE_DIR="${SQLITE_DIR:-$INSTALL_DIR/sqlite}"
-PG_BIN_DIR="${PG_BIN_DIR:-/home/postgres/pg/bin}"
-PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-$INSTALL_DIR/lib/pkgconfig}"
+[[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo ./install.sh"
+[[ -r /etc/os-release ]] || die "/etc/os-release not found"
+# shellcheck disable=SC1091
+source /etc/os-release
+EL_MAJOR="${VERSION_ID%%.*}"
+case "${ID}:${EL_MAJOR}" in
+    rhel:7|rhel:8|centos:7|centos:8|rocky:8|almalinux:8|ol:7|ol:8) ;;
+    *) die "Supported systems: RHEL-compatible EL7/EL8; detected ${ID:-unknown} ${VERSION_ID:-unknown}" ;;
+esac
 
-# 显示进度条的函数
-progress_bar() {
-    local progress=(${1})
-    local total_steps=(${2})
-    local bar_length=50
-    local percent=$((100 * progress / total_steps))
-    local filled_length=$((bar_length * progress / total_steps))
-    local bar=$(printf "%-${bar_length}s" "#" | cut -c1-${filled_length})
-    printf "\r[%-${bar_length}s] %d%%" "${bar}" "${percent}"
+find_pg_config() {
+    local candidate
+    local -a candidates=()
+    [[ -n "$PG_CONFIG" ]] && candidates+=("$PG_CONFIG")
+    [[ -n "${PGBIN:-}" ]] && candidates+=("${PGBIN%/}/pg_config")
+    [[ -n "${PGHOME:-}" ]] && candidates+=("${PGHOME%/}/bin/pg_config")
+    candidates+=(
+        /home/postgres/pghome/bin/pg_config
+        /home/postgres/pg/bin/pg_config
+        /usr/pgsql-17/bin/pg_config
+        /usr/local/pgsql/bin/pg_config
+    )
+    command -v pg_config >/dev/null 2>&1 && candidates+=("$(command -v pg_config)")
+    while IFS= read -r candidate; do candidates+=("$candidate"); done < <(
+        find /home/postgres /opt /usr/local -maxdepth 5 -type f -path '*/bin/pg_config' 2>/dev/null || true
+    )
+
+    for candidate in "${candidates[@]}"; do
+        [[ -x "$candidate" ]] || continue
+        if [[ "$("$candidate" --version 2>/dev/null)" == "PostgreSQL 17."* ]]; then
+            PG_CONFIG="$(readlink -f "$candidate")"
+            return 0
+        fi
+    done
+    return 1
 }
 
-# 帮助函数，用于运行命令并更新进度
-run_command() {
-    ((current_step++))
-    echo
-    echo "步骤 $current_step/$total_steps: $1"
-    progress_bar ${current_step} ${total_steps}
-    eval $2
-    if [ $? -ne 0 ]; then
-        echo -e "\n执行 $1 时出错，正在退出..."
-        exit 1
+find_pg_config || die "PostgreSQL 17 pg_config not found. Set PG_CONFIG or use --pg-config."
+readonly PG_CONFIG
+readonly PG_BINDIR="$("$PG_CONFIG" --bindir)"
+readonly PG_PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
+readonly PG_SHAREDIR="$("$PG_CONFIG" --sharedir)"
+PG_USER="${PG_USER:-$(stat -c '%U' "$PG_BINDIR/postgres")}"
+[[ "$PG_USER" != UNKNOWN ]] || PG_USER=postgres
+readonly PG_USER
+
+# Reuse the environment generated by postgresql17-ha-patroni-etcd. Read only
+# known values, and execute the environment file as the PostgreSQL OS user
+# rather than sourcing a user-owned file into the root shell.
+load_pg_environment() {
+    local pg_home pg_env_file key value
+    pg_home="$(getent passwd "$PG_USER" | cut -d: -f6)"
+    pg_env_file="${pg_home}/.pgev"
+    [[ -r "$pg_env_file" ]] || return 0
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PGHOME|PGDATA|PGPORT|PGDATABASE|PGUSER|PGHOST|PATRONI_CONFIG|PATRONICTL_CONFIG_FILE)
+                [[ -v "$key" && -n "${!key}" ]] || printf -v "$key" '%s' "$value"
+                export "$key"
+                ;;
+        esac
+    done < <(
+        sudo -iu "$PG_USER" bash -c '
+            source "$HOME/.pgev"
+            for key in PGHOME PGDATA PGPORT PGDATABASE PGUSER PGHOST PATRONI_CONFIG PATRONICTL_CONFIG_FILE; do
+                printf "%s=%s\n" "$key" "${!key-}"
+            done
+        '
+    )
+}
+load_pg_environment
+
+[[ -d "$PACKAGES_DIR" ]] || die "Package directory not found: $PACKAGES_DIR"
+
+declare -A ARCHIVES=(
+    [cmake]="CMake-3.30.2.tar.gz"
+    [geos]="geos-3.9.5.tar.bz2"
+    [sqlite]="sqlite-autoconf-3460100.tar.gz"
+    [proj]="proj-6.3.1.tar.gz"
+    [protobuf]="protobuf-all-3.15.3.tar.gz"
+    [protobuf-c]="protobuf-c-1.3.3.tar.gz"
+    [gdal]="gdal-3.0.4.tar.gz"
+    [cgal]="CGAL-4.14.3.tar.xz"
+    [sfcgal]="v1.3.7"
+    [pcre]="pcre-8.45.tar.gz"
+    [postgis]="postgis-3.4.2.tar.gz"
+)
+for archive in "${ARCHIVES[@]}"; do
+    [[ -s "$PACKAGES_DIR/$archive" ]] || die "Missing package: packages/$archive"
+done
+
+if [[ -z "$JOBS" ]]; then
+    JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+fi
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "JOBS must be a positive integer"
+
+log "Detected ${PRETTY_NAME}"
+printf 'PostgreSQL: %s\npg_config: %s\npkglibdir: %s\nsharedir: %s\npackages: %s\n' \
+    "$("$PG_CONFIG" --version)" "$PG_CONFIG" "$PG_PKGLIBDIR" "$PG_SHAREDIR" "$PACKAGES_DIR"
+if ((CHECK_ONLY)); then
+    log "Preflight check passed"
+    exit 0
+fi
+
+install_os_dependencies() {
+    local -a packages=(
+        gcc gcc-c++ make autoconf automake libtool
+        bzip2 xz tar gzip wget sudo
+        gmp-devel mpfr-devel boost-devel
+        libxml2-devel json-c-devel libcurl-devel
+        libtiff-devel libjpeg-turbo-devel libpng-devel
+        zlib-devel openssl-devel readline-devel
+    )
+    if [[ "$EL_MAJOR" == 7 ]]; then
+        yum -y install epel-release || true
     fi
-    echo
+    yum -y install "${packages[@]}"
 }
 
-# 初始化
-total_steps=12
-current_step=0
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/postgis-install.XXXXXX")"
+cleanup() {
+    if [[ "$KEEP_BUILD" == 1 ]]; then
+        log "Build directory retained: $WORK_DIR"
+    else
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+trap cleanup EXIT
 
-# 1. 安装依赖
-run_command "安装依赖项" "yum install -y gcc gmp-devel mpfr-devel boost-devel libxml2 libxml2-devel"
+extract() {
+    local archive="$1"
+    tar -xf "$PACKAGES_DIR/$archive" -C "$WORK_DIR"
+}
 
-# 2. 安装 CMake
-run_command "安装 CMake" "tar -zxvf CMake-3.30.2.tar.gz && cd CMake-3.30.2/ && ./bootstrap && gmake && make install && cd .."
+make_install() {
+    make -j "$JOBS"
+    make install
+}
 
-# 3. 安装 GEOS
-run_command "安装 GEOS" "tar xvfj geos-3.9.5.tar.bz2 && cd geos-3.9.5 && mkdir _build && cd _build && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR .. && make && make install && cd ../.."
+install_os_dependencies
 
-# 4. 安装 SQLite3
-run_command "安装 SQLite3" "tar zxvf sqlite-autoconf-3460100.tar.gz && cd sqlite-autoconf-3460100/ && ./configure --prefix=$SQLITE_DIR && make && make install && cd .."
+log "Building CMake"
+extract "${ARCHIVES[cmake]}"
+pushd "$WORK_DIR/CMake-3.30.2" >/dev/null
+./bootstrap --prefix="$INSTALL_PREFIX" --parallel="$JOBS"
+make_install
+popd >/dev/null
+export PATH="$INSTALL_PREFIX/bin:$SQLITE_PREFIX/bin:$PG_BINDIR:$PATH"
 
-# 5. 安装 Proj
-run_command "安装 Proj" "export SQLITE3=$SQLITE_DIR && export PATH=\$SQLITE3/bin:\$PATH && export PKG_CONFIG_PATH=\$SQLITE3/lib/pkgconfig && tar -zxvf proj-6.3.1.tar.gz && cd proj-6.3.1 && ./configure && make && make install && cd .."
+log "Building GEOS"
+extract "${ARCHIVES[geos]}"
+cmake -S "$WORK_DIR/geos-3.9.5" -B "$WORK_DIR/geos-3.9.5/build" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+cmake --build "$WORK_DIR/geos-3.9.5/build" --parallel "$JOBS"
+cmake --install "$WORK_DIR/geos-3.9.5/build"
 
-# 6. 安装 Protobuf
-run_command "安装 Protobuf" "tar -zxvf protobuf-all-3.15.3.tar.gz && cd protobuf-3.15.3 && ./configure && make && make install && export LD_LIBRARY_PATH=$INSTALL_DIR/lib:\$LD_LIBRARY_PATH && export PKG_CONFIG_PATH=\$INSTALL_DIR/lib/pkgconfig && cd .."
+log "Building SQLite"
+extract "${ARCHIVES[sqlite]}"
+pushd "$WORK_DIR/sqlite-autoconf-3460100" >/dev/null
+./configure --prefix="$SQLITE_PREFIX"
+make_install
+popd >/dev/null
 
-# 7. 安装 Protobuf-C
-run_command "安装 Protobuf-C" "tar -zxvf protobuf-c-1.3.3.tar.gz && cd protobuf-c-1.3.3 && ./configure && make && make install && cd .."
+export PKG_CONFIG_PATH="$SQLITE_PREFIX/lib/pkgconfig:$INSTALL_PREFIX/lib64/pkgconfig:$INSTALL_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export LD_LIBRARY_PATH="$INSTALL_PREFIX/lib64:$INSTALL_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CPPFLAGS="-I$INSTALL_PREFIX/include ${CPPFLAGS:-}"
+export LDFLAGS="-L$INSTALL_PREFIX/lib64 -L$INSTALL_PREFIX/lib ${LDFLAGS:-}"
 
-# 8. 安装 GDAL
-run_command "安装 GDAL" "tar -zxvf gdal-3.0.4.tar.gz && cd gdal-3.0.4 && ./configure LDFLAGS=\"-L$INSTALL_DIR/lib\" CPPFLAGS=\"-I$INSTALL_DIR/include\" && make && make install && cd .."
+log "Building PROJ"
+extract "${ARCHIVES[proj]}"
+pushd "$WORK_DIR/proj-6.3.1" >/dev/null
+./configure --prefix="$INSTALL_PREFIX"
+make_install
+popd >/dev/null
 
-# 9. 安装 CGAL
-run_command "安装 CGAL" "tar -xvf CGAL-4.14.3.tar.xz && cd CGAL-4.14.3 && mkdir build && cd build && cmake .. && make && make install && cd ../.."
+log "Building protobuf"
+extract "${ARCHIVES[protobuf]}"
+pushd "$WORK_DIR/protobuf-3.15.3" >/dev/null
+./configure --prefix="$INSTALL_PREFIX"
+make_install
+popd >/dev/null
 
-# 10. 安装 SFCGAL
-run_command "安装 SFCGAL" "tar -zxvf v1.3.7 && cd SFCGAL-1.3.7/ && mkdir build && cd build && cmake .. && make && make install && ln -s $INSTALL_DIR/lib64/libSFCGAL.so $INSTALL_DIR/lib/libSFCGAL.so && ln -s $INSTALL_DIR/lib64/libSFCGAL.so.1 $INSTALL_DIR/lib/libSFCGAL.so.1 && cd ../.."
+log "Building protobuf-c"
+extract "${ARCHIVES[protobuf-c]}"
+pushd "$WORK_DIR/protobuf-c-1.3.3" >/dev/null
+./configure --prefix="$INSTALL_PREFIX"
+make_install
+popd >/dev/null
 
-# 11. 安装 PCRE
-run_command "安装 PCRE" "tar -zxvf pcre-8.45.tar.gz && cd pcre-8.45 && ./configure && make && make install && cd .."
+log "Building GDAL"
+extract "${ARCHIVES[gdal]}"
+pushd "$WORK_DIR/gdal-3.0.4" >/dev/null
+./configure --prefix="$INSTALL_PREFIX"
+make_install
+popd >/dev/null
 
-# 12. 安装 PostGIS
-run_command "安装 PostGIS" "export PG_CONFIG=$PG_BIN_DIR/pg_config && export PKG_CONFIG_PATH=$PKG_CONFIG_PATH && tar -zxvf postgis-3.4.2.tar.gz && cd postgis-3.4.2/ && ./configure --without-raster && make && make install && cd .."
+log "Building CGAL"
+extract "${ARCHIVES[cgal]}"
+cmake -S "$WORK_DIR/CGAL-4.14.3" -B "$WORK_DIR/CGAL-4.14.3/build" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+cmake --build "$WORK_DIR/CGAL-4.14.3/build" --parallel "$JOBS"
+cmake --install "$WORK_DIR/CGAL-4.14.3/build"
 
-echo -e "\n安装完成。"
+log "Building SFCGAL"
+extract "${ARCHIVES[sfcgal]}"
+cmake -S "$WORK_DIR/SFCGAL-1.3.7" -B "$WORK_DIR/SFCGAL-1.3.7/build" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+cmake --build "$WORK_DIR/SFCGAL-1.3.7/build" --parallel "$JOBS"
+cmake --install "$WORK_DIR/SFCGAL-1.3.7/build"
+
+log "Building PCRE"
+extract "${ARCHIVES[pcre]}"
+pushd "$WORK_DIR/pcre-8.45" >/dev/null
+./configure --prefix="$INSTALL_PREFIX"
+make_install
+popd >/dev/null
+
+log "Building PostGIS for the existing PostgreSQL 17 installation"
+extract "${ARCHIVES[postgis]}"
+pushd "$WORK_DIR/postgis-3.4.2" >/dev/null
+./configure --with-pgconfig="$PG_CONFIG" --without-raster
+make_install
+popd >/dev/null
+
+cat > /etc/ld.so.conf.d/postgis-local.conf <<EOF
+$INSTALL_PREFIX/lib
+$INSTALL_PREFIX/lib64
+$SQLITE_PREFIX/lib
+EOF
+ldconfig
+chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$PG_PKGLIBDIR" "$PG_SHAREDIR/extension"
+
+pg_env=(env "PATH=$PG_BINDIR:$PATH")
+for key in PGHOME PGDATA PGPORT PGDATABASE PGUSER PGHOST; do
+    [[ -n "${!key:-}" ]] && pg_env+=("$key=${!key}")
+done
+
+is_patroni_leader() {
+    sudo -u "$PG_USER" "${pg_env[@]}" "$PG_BINDIR/psql" \
+        -XAtq -d "${PGDATABASE:-postgres}" \
+        -c 'select not pg_is_in_recovery()' 2>/dev/null | grep -qx t
+}
+
+case "$CREATE_EXTENSION" in
+    always) create_now=1 ;;
+    never) create_now=0 ;;
+    auto)
+        if is_patroni_leader; then create_now=1; else create_now=0; fi
+        ;;
+    *) die "CREATE_EXTENSION must be auto, always or never" ;;
+esac
+
+if ((create_now)); then
+    log "Creating/updating postgis extension in ${PGDATABASE:-postgres}"
+    sudo -u "$PG_USER" "${pg_env[@]}" \
+        "$PG_BINDIR/psql" -v ON_ERROR_STOP=1 -d "${PGDATABASE:-postgres}" \
+        -c 'CREATE EXTENSION IF NOT EXISTS postgis;' \
+        -c 'ALTER EXTENSION postgis UPDATE;'
+else
+    log "Extension SQL skipped on this replica; it is replicated from the Patroni leader"
+fi
+
+log "PostGIS installation completed: $("$PG_BINDIR/postgres" --version)"
