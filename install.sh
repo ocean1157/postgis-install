@@ -71,9 +71,16 @@ done
 # shellcheck disable=SC1091
 source /etc/os-release
 EL_MAJOR="${VERSION_ID%%.*}"
-case "${ID}:${EL_MAJOR}" in
-    rhel:7|rhel:8|centos:7|centos:8|rocky:8|almalinux:8|ol:7|ol:8) ;;
+case "$EL_MAJOR" in
+    7|8) ;;
     *) die "Supported systems: RHEL-compatible EL7/EL8; detected ${ID:-unknown} ${VERSION_ID:-unknown}" ;;
+esac
+
+# Anolis OS and other RHEL rebuilds identify compatibility through ID_LIKE
+# instead of using one of the traditional RHEL/CentOS IDs.
+case " ${ID:-} ${ID_LIKE:-} " in
+    *" rhel "*|*" centos "*|*" fedora "*|*" rocky "*|*" almalinux "*|*" ol "*|*" anolis "*) ;;
+    *) die "Unsupported non-RHEL-compatible system: ${ID:-unknown} ${VERSION_ID:-unknown} (ID_LIKE=${ID_LIKE:-unset})" ;;
 esac
 
 find_pg_config() {
