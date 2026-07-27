@@ -1,4 +1,4 @@
-# PostGIS installer for PostgreSQL 17 + Patroni
+# PostGIS installer for PostgreSQL + Patroni
 
 本项目用于在 `postgresql17-ha-patroni-etcd` 已安装好的 PostgreSQL 节点上安装
 PostGIS 3.4.2。脚本只操作当前节点，不包含 SSH、SCP 或集群分发逻辑；需要在哪个
@@ -91,7 +91,7 @@ GDAL、SFCGAL、protobuf-c、PCRE 和 PostGIS 版本；达到最低要求的组�
 sudo ./install.sh --source-only
 ```
 
-如果未自动找到 PostgreSQL 17：
+如果未自动找到 PostgreSQL：
 
 ```bash
 sudo ./install.sh --pg-config /home/postgres/pghome/bin/pg_config

@@ -20,7 +20,7 @@ KEEP_BUILD="${KEEP_BUILD:-0}"
 PREFER_YUM="${PREFER_YUM:-1}"
 # ====================================================================
 
-# PostGIS source installer for PostgreSQL 17 clusters managed by Patroni.
+# PostGIS source installer for PostgreSQL clusters managed by Patroni.
 # Run this script as root on every PostgreSQL node. It detects the PostgreSQL
 # installation produced by postgresql17-ha-patroni-etcd and never replaces it.
 
@@ -31,14 +31,16 @@ usage() {
     cat <<'EOF'
 Usage: sudo ./install.sh [options]
 
-Installs PostGIS against the existing PostgreSQL 17/Patroni installation.
+Installs PostGIS against the existing PostgreSQL/Patroni installation.
 Run it on every PostgreSQL node; on the Patroni leader it also creates the
 postgis extension in the target database by default.
+The script must run as root and switches to the PostgreSQL OS user internally
+for environment discovery and database commands.
 
 Options:
   -i, --prefix DIR          Dependency installation prefix (default: /usr/local)
   -s, --sqlite-prefix DIR   SQLite installation prefix (default: PREFIX/sqlite)
-  -p, --pg-config FILE      Existing PostgreSQL 17 pg_config path
+  -p, --pg-config FILE      Existing PostgreSQL pg_config path
   -d, --database NAME       Database used for CREATE EXTENSION (default: postgres)
       --create-extension    Always create the extension (must run on leader)
       --no-create-extension Do not create the extension
@@ -157,7 +159,7 @@ CREATE_EXTENSION="${CREATE_EXTENSION:-auto}"
 readonly PACKAGES_DIR
 
 find_pg_config() {
-    local candidate
+    local candidate version
     local -a candidates=()
     [[ -n "$PG_CONFIG" ]] && candidates+=("$PG_CONFIG")
     [[ -n "$PG_LOGIN_PG_CONFIG" ]] && candidates+=("$PG_LOGIN_PG_CONFIG")
@@ -176,7 +178,8 @@ find_pg_config() {
 
     for candidate in "${candidates[@]}"; do
         [[ -x "$candidate" ]] || continue
-        if [[ "$("$candidate" --version 2>/dev/null)" == "PostgreSQL 17."* ]]; then
+        version="$("$candidate" --version 2>/dev/null || true)"
+        if [[ "$version" == PostgreSQL\ * ]]; then
             PG_CONFIG="$(readlink -f "$candidate")"
             return 0
         fi
@@ -184,11 +187,15 @@ find_pg_config() {
     return 1
 }
 
-find_pg_config || die "PostgreSQL 17 pg_config not found. Set PG_CONFIG or use --pg-config."
+find_pg_config || die "PostgreSQL pg_config not found. Set PG_CONFIG or use --pg-config."
 readonly PG_CONFIG
 readonly PG_BINDIR="$("$PG_CONFIG" --bindir)"
 readonly PG_PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
 readonly PG_SHAREDIR="$("$PG_CONFIG" --sharedir)"
+[[ -x "$PG_BINDIR/postgres" ]] ||
+    die "Selected pg_config does not match a complete PostgreSQL installation: $PG_CONFIG"
+[[ -x "$PG_BINDIR/psql" ]] ||
+    die "psql was not found beside the selected PostgreSQL installation: $PG_BINDIR"
 PG_USER="${PG_USER:-$(stat -c '%U' "$PG_BINDIR/postgres")}"
 [[ "$PG_USER" != UNKNOWN ]] || PG_USER=postgres
 readonly PG_USER
@@ -547,7 +554,7 @@ fi
 if [[ -n "$POSTGIS_INSTALLED_VERSION" ]] && version_ge "$POSTGIS_INSTALLED_VERSION" 3.4.2; then
     log "Already installed: PostGIS ${POSTGIS_INSTALLED_VERSION}; skipping source build"
 else
-    log "Building PostGIS for the existing PostgreSQL 17 installation"
+    log "Building PostGIS for the existing PostgreSQL installation"
     extract "${ARCHIVES[postgis]}"
     pushd "$WORK_DIR/postgis-3.4.2" >/dev/null
     ./configure --with-pgconfig="$PG_CONFIG" --without-raster
@@ -569,7 +576,7 @@ for key in PGHOME PGDATA PGPORT PGDATABASE PGUSER PGHOST; do
 done
 
 is_patroni_leader() {
-    sudo -u "$PG_USER" "${pg_env[@]}" "$PG_BINDIR/psql" \
+    sudo -iu "$PG_USER" "${pg_env[@]}" "$PG_BINDIR/psql" \
         -XAtq -d "${PGDATABASE:-postgres}" \
         -c 'select not pg_is_in_recovery()' 2>/dev/null | grep -qx t
 }
@@ -585,7 +592,7 @@ esac
 
 if ((create_now)); then
     log "Creating/updating postgis extension in ${PGDATABASE:-postgres}"
-    sudo -u "$PG_USER" "${pg_env[@]}" \
+    sudo -iu "$PG_USER" "${pg_env[@]}" \
         "$PG_BINDIR/psql" -v ON_ERROR_STOP=1 -d "${PGDATABASE:-postgres}" \
         -c 'CREATE EXTENSION IF NOT EXISTS postgis;' \
         -c 'ALTER EXTENSION postgis UPDATE;'
