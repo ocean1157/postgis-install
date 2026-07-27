@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ======================== User configuration ========================
+# Leave a value empty to discover it from the postgres login environment and
+# postgresql17-ha-patroni-etcd's ~/.pgev. If discovery fails, defaults below
+# are applied. Command-line options override these values.
+PG_USER="${PG_USER:-}"
+PG_CONFIG="${PG_CONFIG:-}"
+PGHOME="${PGHOME:-}"
+PGBIN="${PGBIN:-}"
+PGPORT="${PGPORT:-}"
+PGDATABASE="${PGDATABASE:-}"
+INSTALL_PREFIX="${INSTALL_PREFIX:-}"
+SQLITE_PREFIX="${SQLITE_PREFIX:-}"
+PACKAGES_DIR="${PACKAGES_DIR:-}"
+JOBS="${JOBS:-}"
+CREATE_EXTENSION="${CREATE_EXTENSION:-}"
+KEEP_BUILD="${KEEP_BUILD:-0}"
+PREFER_YUM="${PREFER_YUM:-1}"
+# ====================================================================
+
 # PostGIS source installer for PostgreSQL 17 clusters managed by Patroni.
 # Run this script as root on every PostgreSQL node. It detects the PostgreSQL
 # installation produced by postgresql17-ha-patroni-etcd and never replaces it.
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly PACKAGES_DIR="${PACKAGES_DIR:-${SCRIPT_DIR}/packages}"
-
-INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
-SQLITE_PREFIX="${SQLITE_PREFIX:-${INSTALL_PREFIX}/sqlite}"
-PG_CONFIG="${PG_CONFIG:-}"
-JOBS="${JOBS:-}"
-CREATE_EXTENSION="${CREATE_EXTENSION:-auto}"
-KEEP_BUILD="${KEEP_BUILD:-0}"
 CHECK_ONLY=0
-PREFER_YUM="${PREFER_YUM:-1}"
 
 usage() {
     cat <<'EOF'
@@ -45,18 +55,23 @@ EOF
 
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+require_option_value() {
+    [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != -* ]] ||
+        die "Option $1 requires a value"
+}
 
 while (($#)); do
     case "$1" in
-        -i|--prefix) INSTALL_PREFIX="$2"; shift 2 ;;
-        -s|--sqlite-prefix) SQLITE_PREFIX="$2"; shift 2 ;;
+        -i|--prefix) require_option_value "$@"; INSTALL_PREFIX="$2"; shift 2 ;;
+        -s|--sqlite-prefix) require_option_value "$@"; SQLITE_PREFIX="$2"; shift 2 ;;
         -p|--pg-config)
+            require_option_value "$@"
             PG_CONFIG="$2"
             [[ "$PG_CONFIG" == */pg_config ]] || PG_CONFIG="${PG_CONFIG%/}/pg_config"
             shift 2
             ;;
-        -d|--database) PGDATABASE="$2"; shift 2 ;;
-        -j|--jobs) JOBS="$2"; shift 2 ;;
+        -d|--database) require_option_value "$@"; PGDATABASE="$2"; shift 2 ;;
+        -j|--jobs) require_option_value "$@"; JOBS="$2"; shift 2 ;;
         --create-extension) CREATE_EXTENSION=always; shift ;;
         --no-create-extension) CREATE_EXTENSION=never; shift ;;
         --check) CHECK_ONLY=1; shift ;;
@@ -83,10 +98,69 @@ case " ${ID:-} ${ID_LIKE:-} " in
     *) die "Unsupported non-RHEL-compatible system: ${ID:-unknown} ${VERSION_ID:-unknown} (ID_LIKE=${ID_LIKE:-unset})" ;;
 esac
 
+PG_USER="${PG_USER:-postgres}"
+PG_LOGIN_PG_CONFIG=""
+
+# First inspect the postgres login environment, then read only known values
+# from .pgev. This preserves explicit top-of-file/CLI values.
+load_pg_environment() {
+    local pg_home pg_env_file line key value login_pg_config
+    getent passwd "$PG_USER" >/dev/null 2>&1 || return 0
+    pg_home="$(getent passwd "$PG_USER" | cut -d: -f6)"
+
+    if command -v sudo >/dev/null 2>&1; then
+        login_pg_config="$(
+            sudo -iu "$PG_USER" bash -lc 'command -v pg_config 2>/dev/null || true' 2>/dev/null |
+                tail -n1
+        )"
+    elif command -v runuser >/dev/null 2>&1; then
+        login_pg_config="$(
+            runuser -l "$PG_USER" -c "bash -lc 'command -v pg_config 2>/dev/null || true'" 2>/dev/null |
+                tail -n1
+        )"
+    else
+        login_pg_config="$(
+            su - "$PG_USER" -c "bash -lc 'command -v pg_config 2>/dev/null || true'" 2>/dev/null |
+                tail -n1
+        )"
+    fi
+    [[ -n "$login_pg_config" ]] && PG_LOGIN_PG_CONFIG="$login_pg_config"
+
+    pg_env_file="${pg_home}/.pgev"
+    [[ -r "$pg_env_file" ]] || return 0
+    while IFS= read -r line; do
+        [[ "$line" == export\ *=* ]] || continue
+        key="${line#export }"
+        key="${key%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            PGHOME|PGBIN|PGDATA|PGPORT|PGDATABASE|PGUSER|PGHOST|PATRONI_CONFIG|PATRONICTL_CONFIG_FILE)
+                if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+                    value="${value:1:${#value}-2}"
+                elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+                    value="${value:1:${#value}-2}"
+                fi
+                [[ -n "${!key:-}" ]] || printf -v "$key" '%s' "$value"
+                export "$key"
+                ;;
+        esac
+    done < "$pg_env_file"
+}
+load_pg_environment
+
+# Apply defaults only after postgres environment discovery.
+INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+SQLITE_PREFIX="${SQLITE_PREFIX:-${INSTALL_PREFIX}/sqlite}"
+PACKAGES_DIR="${PACKAGES_DIR:-${SCRIPT_DIR}/packages}"
+PGDATABASE="${PGDATABASE:-postgres}"
+CREATE_EXTENSION="${CREATE_EXTENSION:-auto}"
+readonly PACKAGES_DIR
+
 find_pg_config() {
     local candidate
     local -a candidates=()
     [[ -n "$PG_CONFIG" ]] && candidates+=("$PG_CONFIG")
+    [[ -n "$PG_LOGIN_PG_CONFIG" ]] && candidates+=("$PG_LOGIN_PG_CONFIG")
     [[ -n "${PGBIN:-}" ]] && candidates+=("${PGBIN%/}/pg_config")
     [[ -n "${PGHOME:-}" ]] && candidates+=("${PGHOME%/}/bin/pg_config")
     candidates+=(
@@ -133,35 +207,6 @@ declare -A MIN_VERSION=(
     [llvm]=6.0
 )
 
-# Reuse the environment generated by postgresql17-ha-patroni-etcd. Read only
-# known values, and execute the environment file as the PostgreSQL OS user
-# rather than sourcing a user-owned file into the root shell.
-load_pg_environment() {
-    local pg_home pg_env_file line key value
-    pg_home="$(getent passwd "$PG_USER" | cut -d: -f6)"
-    pg_env_file="${pg_home}/.pgev"
-    [[ -r "$pg_env_file" ]] || return 0
-
-    while IFS= read -r line; do
-        [[ "$line" == export\ *=* ]] || continue
-        key="${line#export }"
-        key="${key%%=*}"
-        value="${line#*=}"
-        case "$key" in
-            PGHOME|PGDATA|PGPORT|PGDATABASE|PGUSER|PGHOST|PATRONI_CONFIG|PATRONICTL_CONFIG_FILE)
-                if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-                    value="${value:1:${#value}-2}"
-                elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-                    value="${value:1:${#value}-2}"
-                fi
-                [[ -v "$key" && -n "${!key}" ]] || printf -v "$key" '%s' "$value"
-                export "$key"
-                ;;
-        esac
-    done < "$pg_env_file"
-}
-load_pg_environment
-
 [[ -d "$PACKAGES_DIR" ]] || die "Package directory not found: $PACKAGES_DIR"
 
 declare -A ARCHIVES=(
@@ -198,15 +243,85 @@ install_os_dependencies() {
         libtiff-devel libjpeg-turbo-devel libpng-devel
         zlib-devel openssl-devel readline-devel
     )
-    if [[ "$EL_MAJOR" == 7 ]]; then
+    local -a missing=()
+    local package
+    for package in "${packages[@]}"; do
+        rpm -q "$package" >/dev/null 2>&1 || missing+=("$package")
+    done
+    if [[ "$EL_MAJOR" == 7 ]] && ! rpm -q epel-release >/dev/null 2>&1; then
         yum -y install epel-release || true
     fi
-    yum -y install "${packages[@]}"
+    if ((${#missing[@]} == 0)); then
+        log "All required OS build RPMs are already installed; skipping yum install"
+    else
+        log "Installing missing OS build RPMs: ${missing[*]}"
+        yum -y install "${missing[@]}"
+    fi
 }
 
 version_ge() {
     local actual="${1%%-*}" minimum="$2"
     [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" == "$minimum" ]]
+}
+
+export PATH="$INSTALL_PREFIX/bin:$SQLITE_PREFIX/bin:$PG_BINDIR:$PATH"
+export PKG_CONFIG_PATH="$SQLITE_PREFIX/lib/pkgconfig:$INSTALL_PREFIX/lib64/pkgconfig:$INSTALL_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export LD_LIBRARY_PATH="$INSTALL_PREFIX/lib64:$INSTALL_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CPPFLAGS="-I$INSTALL_PREFIX/include ${CPPFLAGS:-}"
+export LDFLAGS="-L$INSTALL_PREFIX/lib64 -L$INSTALL_PREFIX/lib ${LDFLAGS:-}"
+
+extract_numeric_version() {
+    grep -Eo '[0-9]+([.][0-9]+)+' | head -n1 || true
+}
+
+installed_dependency_version() {
+    local component="$1" tool output=""
+    case "$component" in
+        cmake)
+            tool="$(command -v cmake 2>/dev/null || true)"
+            [[ -n "$tool" ]] && output="$("$tool" --version 2>/dev/null | head -n1)"
+            ;;
+        geos)
+            tool="$(command -v geos-config 2>/dev/null || true)"
+            [[ -n "$tool" ]] && output="$("$tool" --version 2>/dev/null)"
+            ;;
+        proj)
+            if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists proj; then
+                output="$(pkg-config --modversion proj 2>/dev/null)"
+            fi
+            ;;
+        gdal)
+            tool="$(command -v gdal-config 2>/dev/null || true)"
+            [[ -n "$tool" ]] && output="$("$tool" --version 2>/dev/null)"
+            ;;
+        sfcgal)
+            tool="$(command -v sfcgal-config 2>/dev/null || true)"
+            [[ -n "$tool" ]] && output="$("$tool" --version 2>/dev/null)"
+            ;;
+        protobuf-c)
+            tool="$(command -v protoc-c 2>/dev/null || true)"
+            [[ -n "$tool" ]] && output="$("$tool" --version 2>/dev/null)"
+            ;;
+        pcre)
+            tool="$(command -v pcre-config 2>/dev/null || true)"
+            [[ -n "$tool" ]] && output="$("$tool" --version 2>/dev/null)"
+            ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$output" ]] || return 1
+    printf '%s\n' "$output" | extract_numeric_version
+}
+
+use_installed_dependency() {
+    local component="$1" minimum="$2" installed
+    installed="$(installed_dependency_version "$component")"
+    [[ -n "$installed" ]] || return 1
+    if version_ge "$installed" "$minimum"; then
+        log "Already installed: ${component} ${installed} (required >= ${minimum}); skipping"
+        return 0
+    fi
+    log "Installed ${component} ${installed} is below ${minimum}; looking for a newer yum/source version"
+    return 1
 }
 
 yum_candidate_version() {
@@ -240,6 +355,15 @@ prefer_yum_dependency() {
     return 1
 }
 
+select_dependency() {
+    local flag="$1" component="$2" package="$3" minimum="$4"
+    if use_installed_dependency "$component" "$minimum"; then
+        printf -v "$flag" '%s' 1
+    elif prefer_yum_dependency "$component" "$package" "$minimum"; then
+        printf -v "$flag" '%s' 1
+    fi
+}
+
 print_dependency_policy() {
     cat <<EOF
 Dependency minimums (PostGIS 3.4):
@@ -268,6 +392,11 @@ report_yum_candidate() {
 
 print_dependency_policy
 if ((CHECK_ONLY)); then
+    log "Installed dependency versions"
+    for component in cmake geos proj gdal sfcgal protobuf-c pcre; do
+        installed="$(installed_dependency_version "$component")"
+        printf '  %-12s %s\n' "$component" "${installed:-not found}"
+    done
     if [[ "$PREFER_YUM" == 1 ]]; then
         log "Enabled yum repository candidates"
         report_yum_candidate geos-devel "${MIN_VERSION[geos]}"
@@ -314,13 +443,13 @@ USE_SYSTEM_PROTOBUF_C=0
 USE_SYSTEM_PCRE=0
 USE_SYSTEM_CMAKE=0
 
-prefer_yum_dependency cmake cmake 3.13 && USE_SYSTEM_CMAKE=1
-prefer_yum_dependency geos geos-devel "${MIN_VERSION[geos]}" && USE_SYSTEM_GEOS=1
-prefer_yum_dependency proj proj-devel "${MIN_VERSION[proj]}" && USE_SYSTEM_PROJ=1
-prefer_yum_dependency gdal gdal-devel "${MIN_VERSION[gdal]}" && USE_SYSTEM_GDAL=1
-prefer_yum_dependency sfcgal SFCGAL-devel "${MIN_VERSION[sfcgal]}" && USE_SYSTEM_SFCGAL=1
-prefer_yum_dependency protobuf-c protobuf-c-devel "${MIN_VERSION[protobuf-c]}" && USE_SYSTEM_PROTOBUF_C=1
-prefer_yum_dependency pcre pcre-devel 8.0 && USE_SYSTEM_PCRE=1
+select_dependency USE_SYSTEM_CMAKE cmake cmake 3.13
+select_dependency USE_SYSTEM_GEOS geos geos-devel "${MIN_VERSION[geos]}"
+select_dependency USE_SYSTEM_PROJ proj proj-devel "${MIN_VERSION[proj]}"
+select_dependency USE_SYSTEM_GDAL gdal gdal-devel "${MIN_VERSION[gdal]}"
+select_dependency USE_SYSTEM_SFCGAL sfcgal SFCGAL-devel "${MIN_VERSION[sfcgal]}"
+select_dependency USE_SYSTEM_PROTOBUF_C protobuf-c protobuf-c-devel "${MIN_VERSION[protobuf-c]}"
+select_dependency USE_SYSTEM_PCRE pcre pcre-devel 8.0
 
 if ((USE_SYSTEM_CMAKE == 0)); then
     log "Building CMake"
@@ -330,7 +459,6 @@ if ((USE_SYSTEM_CMAKE == 0)); then
     make_install
     popd >/dev/null
 fi
-export PATH="$INSTALL_PREFIX/bin:$SQLITE_PREFIX/bin:$PG_BINDIR:$PATH"
 
 if ((USE_SYSTEM_GEOS == 0)); then
     log "Building GEOS"
@@ -349,11 +477,6 @@ if ((USE_SYSTEM_PROJ == 0)); then
     make_install
     popd >/dev/null
 fi
-
-export PKG_CONFIG_PATH="$SQLITE_PREFIX/lib/pkgconfig:$INSTALL_PREFIX/lib64/pkgconfig:$INSTALL_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export LD_LIBRARY_PATH="$INSTALL_PREFIX/lib64:$INSTALL_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-export CPPFLAGS="-I$INSTALL_PREFIX/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$INSTALL_PREFIX/lib64 -L$INSTALL_PREFIX/lib ${LDFLAGS:-}"
 
 if ((USE_SYSTEM_PROJ == 0)); then
     log "Building PROJ"
@@ -414,12 +537,23 @@ if ((USE_SYSTEM_PCRE == 0)); then
     popd >/dev/null
 fi
 
-log "Building PostGIS for the existing PostgreSQL 17 installation"
-extract "${ARCHIVES[postgis]}"
-pushd "$WORK_DIR/postgis-3.4.2" >/dev/null
-./configure --with-pgconfig="$PG_CONFIG" --without-raster
-make_install
-popd >/dev/null
+POSTGIS_CONTROL="$PG_SHAREDIR/extension/postgis.control"
+POSTGIS_INSTALLED_VERSION=""
+if [[ -f "$PG_PKGLIBDIR/postgis-3.so" && -r "$POSTGIS_CONTROL" ]]; then
+    POSTGIS_INSTALLED_VERSION="$(
+        awk -F"'" '/^[[:space:]]*default_version[[:space:]]*=/{print $2; exit}' "$POSTGIS_CONTROL"
+    )"
+fi
+if [[ -n "$POSTGIS_INSTALLED_VERSION" ]] && version_ge "$POSTGIS_INSTALLED_VERSION" 3.4.2; then
+    log "Already installed: PostGIS ${POSTGIS_INSTALLED_VERSION}; skipping source build"
+else
+    log "Building PostGIS for the existing PostgreSQL 17 installation"
+    extract "${ARCHIVES[postgis]}"
+    pushd "$WORK_DIR/postgis-3.4.2" >/dev/null
+    ./configure --with-pgconfig="$PG_CONFIG" --without-raster
+    make_install
+    popd >/dev/null
+fi
 
 cat > /etc/ld.so.conf.d/postgis-local.conf <<EOF
 $INSTALL_PREFIX/lib

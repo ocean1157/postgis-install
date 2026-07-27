@@ -67,6 +67,24 @@ sudo ./install.sh --check
 sudo ./install.sh
 ```
 
+所有常用路径和参数也集中放在 `install.sh` 开头的 `User configuration`
+配置区，可以直接编辑。取值优先级为：
+
+```text
+命令行参数或脚本顶部配置
+→ postgres 登录环境和 /home/postgres/.pgev
+→ 脚本默认值
+```
+
+使用 root 执行且 PostgreSQL 路径留空时，脚本会先以 postgres 登录用户查找
+`pg_config`，再读取 HA 项目创建的 `.pgev`；仍未找到时才检查
+`/home/postgres/pghome`、`/home/postgres/pg`、`/usr/pgsql-17` 等默认路径。
+
+脚本可安全重复执行。每次运行会先检查当前节点实际安装的 CMake、GEOS、PROJ、
+GDAL、SFCGAL、protobuf-c、PCRE 和 PostGIS 版本；达到最低要求的组件直接跳过，
+只有缺失或版本过低的组件才继续尝试 yum 或 `packages/` 源码。已经安装的基础
+构建 RPM 也不会再次调用 yum 安装。
+
 完全不使用 yum 中的 GIS 依赖、强制采用 `packages/`：
 
 ```bash
