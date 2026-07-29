@@ -4,12 +4,13 @@ set -Eeuo pipefail
 
 # Download the complete RPM dependency closure for the current EL7/EL8 host.
 # GIS packages are included only when the enabled repositories provide a
-# version that satisfies the PostGIS 3.4 minimum; install.sh uses bundled
+# version that satisfies the selected PostGIS minimum; install.sh uses bundled
 # sources for the remaining components.
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PACKAGES_DIR="${PACKAGES_DIR:-${SCRIPT_DIR}/packages}"
 CHECK_ONLY=0
+POSTGIS_SERIES="${POSTGIS_SERIES:-3.6}"
 
 log() { printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -66,6 +67,42 @@ version_ge() {
     [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" == "$minimum" ]]
 }
 
+detect_postgis_version() {
+    local path filename version best=""
+    while IFS= read -r path; do
+        filename="${path##*/}"
+        version="${filename#postgis-}"
+        version="${version%.tar.gz}"
+        [[ "$version" =~ ^[0-9]+([.][0-9]+)+$ ]] || continue
+        [[ "$version" == "$POSTGIS_SERIES".* ]] || continue
+        if [[ -z "$best" ]] || version_ge "$version" "$best"; then
+            best="$version"
+        fi
+    done < <(find "$PACKAGES_DIR" -maxdepth 1 -type f -name 'postgis-*.tar.gz' -print)
+    [[ -n "$best" ]] ||
+        die "No stable PostGIS ${POSTGIS_SERIES}.x archive in ${PACKAGES_DIR}; run install.sh online first"
+    printf '%s\n' "$best"
+}
+
+POSTGIS_VERSION="$(detect_postgis_version)"
+POSTGIS_SELECTED_SERIES="${POSTGIS_VERSION%.*}"
+case "$POSTGIS_SELECTED_SERIES" in
+    3.6|3.5)
+        GEOS_MIN=3.8
+        PROJ_MIN=6.1
+        GDAL_MIN=3.0
+        SFCGAL_MIN=1.4.1
+        PROTOBUF_C_MIN=1.1
+        ;;
+    *)
+        GEOS_MIN=3.6
+        PROJ_MIN=6.1
+        GDAL_MIN=2.0
+        SFCGAL_MIN=1.3.1
+        PROTOBUF_C_MIN=1.1
+        ;;
+esac
+
 yum_candidate_version() {
     local package="$1"
     yum --showduplicates list available "$package" 2>/dev/null |
@@ -102,11 +139,12 @@ select_if_usable() {
 }
 
 select_if_usable cmake 3.13
-select_if_usable geos-devel 3.6
-select_if_usable proj-devel 6.1
-select_if_usable gdal-devel 2.0
-select_if_usable SFCGAL-devel 1.3.1
-select_if_usable protobuf-c-devel 1.1.0
+log "Selected PostGIS ${POSTGIS_VERSION}; applying its dependency minimums"
+select_if_usable geos-devel "$GEOS_MIN"
+select_if_usable proj-devel "$PROJ_MIN"
+select_if_usable gdal-devel "$GDAL_MIN"
+select_if_usable SFCGAL-devel "$SFCGAL_MIN"
+select_if_usable protobuf-c-devel "$PROTOBUF_C_MIN"
 select_if_usable pcre-devel 8.0
 
 ALL_PACKAGES=("${ROOT_PACKAGES[@]}" "${GIS_PACKAGES[@]}")

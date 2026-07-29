@@ -18,6 +18,8 @@ JOBS="${JOBS:-}"
 CREATE_EXTENSION="${CREATE_EXTENSION:-}"
 KEEP_BUILD="${KEEP_BUILD:-0}"
 PREFER_YUM="${PREFER_YUM:-1}"
+AUTO_DOWNLOAD="${AUTO_DOWNLOAD:-1}"
+POSTGIS_SERIES="${POSTGIS_SERIES:-3.6}"
 # ====================================================================
 
 # PostGIS source installer for PostgreSQL clusters managed by Patroni.
@@ -51,7 +53,7 @@ Options:
 
 Environment overrides: PG_CONFIG, PGHOME, PGBIN, PGPORT, PGDATABASE,
 INSTALL_PREFIX, SQLITE_PREFIX, PACKAGES_DIR, JOBS, CREATE_EXTENSION,
-PREFER_YUM (1 by default, set to 0 to build every bundled dependency).
+PREFER_YUM, AUTO_DOWNLOAD and POSTGIS_SERIES.
 EOF
 }
 
@@ -200,9 +202,8 @@ PG_USER="${PG_USER:-$(stat -c '%U' "$PG_BINDIR/postgres")}"
 [[ "$PG_USER" != UNKNOWN ]] || PG_USER=postgres
 readonly PG_USER
 
-# Minimum versions documented by the PostGIS 3.4 installation manual.
-# For optional libraries we use the recommended version when it unlocks all
-# PostGIS functionality.
+# Baseline values are replaced below according to the automatically selected
+# PostGIS series. Optional libraries use the documented compatible minimum.
 declare -A MIN_VERSION=(
     [geos]=3.6
     [proj]=6.1
@@ -214,24 +215,142 @@ declare -A MIN_VERSION=(
     [llvm]=6.0
 )
 
+version_ge() {
+    local actual="${1%%-*}" minimum="$2"
+    [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" == "$minimum" ]]
+}
+
 [[ -d "$PACKAGES_DIR" ]] || die "Package directory not found: $PACKAGES_DIR"
 
-declare -A ARCHIVES=(
-    [cmake]="CMake-3.30.2.tar.gz"
-    [geos]="geos-3.9.5.tar.bz2"
-    [sqlite]="sqlite-autoconf-3460100.tar.gz"
-    [proj]="proj-6.3.1.tar.gz"
-    [protobuf]="protobuf-all-3.15.3.tar.gz"
-    [protobuf-c]="protobuf-c-1.3.3.tar.gz"
-    [gdal]="gdal-3.0.4.tar.gz"
-    [cgal]="CGAL-4.14.3.tar.xz"
-    [sfcgal]="v1.3.7"
-    [pcre]="pcre-8.45.tar.gz"
-    [postgis]="postgis-3.4.2.tar.gz"
-)
-for archive in "${ARCHIVES[@]}"; do
-    [[ -s "$PACKAGES_DIR/$archive" ]] || die "Missing package: packages/$archive"
-done
+declare -A ARCHIVES=()
+declare -A ARCHIVE_VERSIONS=()
+declare -A SOURCE_DIRS=()
+
+archive_version() {
+    local component="$1" filename="$2"
+    case "$component:$filename" in
+        cmake:CMake-*.tar.gz|cmake:cmake-*.tar.gz)
+            filename="${filename#*-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        geos:geos-*.tar.bz2)
+            filename="${filename#geos-}"; printf '%s\n' "${filename%.tar.bz2}" ;;
+        sqlite:sqlite-autoconf-*.tar.gz)
+            filename="${filename#sqlite-autoconf-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        proj:proj-*.tar.gz)
+            filename="${filename#proj-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        protobuf:protobuf-all-*.tar.gz)
+            filename="${filename#protobuf-all-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        protobuf-c:protobuf-c-*.tar.gz)
+            filename="${filename#protobuf-c-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        gdal:gdal-*.tar.gz)
+            filename="${filename#gdal-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        cgal:CGAL-*.tar.xz|cgal:CGAL-*.tar.gz)
+            filename="${filename#CGAL-}"; filename="${filename%.tar.xz}"
+            printf '%s\n' "${filename%.tar.gz}" ;;
+        sfcgal:v[0-9]*|sfcgal:SFCGAL-*.tar.gz)
+            filename="${filename#SFCGAL-}"; filename="${filename#v}"
+            printf '%s\n' "${filename%.tar.gz}" ;;
+        pcre:pcre-*.tar.gz)
+            filename="${filename#pcre-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        postgis:postgis-*.tar.gz)
+            filename="${filename#postgis-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+        *) return 1 ;;
+    esac
+}
+
+select_highest_archive() {
+    local component="$1" minimum="${2:-0}" series="${3:-}"
+    local filename version best_file="" best_version=""
+    while IFS= read -r filename; do
+        filename="${filename##*/}"
+        version="$(archive_version "$component" "$filename" 2>/dev/null || true)"
+        [[ "$version" =~ ^[0-9]+([.][0-9]+)+$ ]] || continue
+        [[ -z "$series" || "$version" == "$series".* ]] || continue
+        version_ge "$version" "$minimum" || continue
+        if [[ -z "$best_version" ]] || version_ge "$version" "$best_version"; then
+            best_file="$filename"
+            best_version="$version"
+        fi
+    done < <(find "$PACKAGES_DIR" -maxdepth 1 -type f -print)
+    [[ -n "$best_file" ]] || return 1
+    ARCHIVES["$component"]="$best_file"
+    ARCHIVE_VERSIONS["$component"]="$best_version"
+}
+
+download_file() {
+    local url="$1" output="$2"
+    [[ "$AUTO_DOWNLOAD" == 1 ]] ||
+        die "Required source is missing and AUTO_DOWNLOAD=0: ${output##*/}"
+    log "Downloading official source: $url"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 5 --connect-timeout 20 "$url" -o "${output}.part"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --tries=5 --timeout=20 -O "${output}.part" "$url"
+    else
+        die "curl or wget is required to download missing source packages"
+    fi
+    mv -f "${output}.part" "$output"
+}
+
+ensure_source_archive() {
+    local component="$1" minimum="$2" fallback_file="$3" url="$4"
+    select_highest_archive "$component" "$minimum" && return 0
+    download_file "$url" "$PACKAGES_DIR/$fallback_file"
+    select_highest_archive "$component" "$minimum" ||
+        die "Downloaded source does not satisfy ${component} >= ${minimum}"
+}
+
+ensure_postgis_archive() {
+    local index_url="https://download.osgeo.org/postgis/source/" html filename
+    select_highest_archive postgis "$POSTGIS_SERIES" "$POSTGIS_SERIES" && return 0
+    [[ "$AUTO_DOWNLOAD" == 1 ]] ||
+        die "No stable PostGIS ${POSTGIS_SERIES}.x archive found in packages/"
+    log "Discovering latest stable PostGIS ${POSTGIS_SERIES}.x source"
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL --retry 5 "$index_url")"
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$index_url")"
+    else
+        die "curl or wget is required to discover PostGIS releases"
+    fi
+    filename="$(
+        printf '%s' "$html" |
+            grep -Eo "postgis-${POSTGIS_SERIES//./[.]}\.[0-9]+[.]tar[.]gz" |
+            sort -Vu | tail -n1
+    )"
+    [[ -n "$filename" ]] || die "No stable PostGIS ${POSTGIS_SERIES}.x release found"
+    download_file "${index_url}${filename}" "$PACKAGES_DIR/$filename"
+    select_highest_archive postgis "$POSTGIS_SERIES" "$POSTGIS_SERIES" ||
+        die "Failed to select downloaded PostGIS archive"
+}
+
+ensure_postgis_archive
+POSTGIS_VERSION="${ARCHIVE_VERSIONS[postgis]}"
+POSTGIS_SERIES_SELECTED="${POSTGIS_VERSION%.*}"
+log "Selected highest stable packages/ archive: ${ARCHIVES[postgis]} (PostGIS ${POSTGIS_VERSION})"
+
+case "$POSTGIS_SERIES_SELECTED" in
+    3.6)
+        MIN_VERSION[geos]=3.8
+        MIN_VERSION[proj]=6.1
+        MIN_VERSION[gdal]=3.0
+        MIN_VERSION[sfcgal]=1.4.1
+        MIN_VERSION[protobuf-c]=1.1.0
+        ;;
+    3.5)
+        MIN_VERSION[geos]=3.8
+        MIN_VERSION[proj]=6.1
+        MIN_VERSION[gdal]=2.0
+        MIN_VERSION[sfcgal]=1.4.1
+        MIN_VERSION[protobuf-c]=1.1.0
+        ;;
+    *)
+        MIN_VERSION[geos]=3.6
+        MIN_VERSION[proj]=6.1
+        MIN_VERSION[gdal]=2.0
+        MIN_VERSION[sfcgal]=1.3.1
+        MIN_VERSION[protobuf-c]=1.1.0
+        ;;
+esac
 
 if [[ -z "$JOBS" ]]; then
     JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
@@ -264,11 +383,6 @@ install_os_dependencies() {
         log "Installing missing OS build RPMs: ${missing[*]}"
         yum -y install "${missing[@]}"
     fi
-}
-
-version_ge() {
-    local actual="${1%%-*}" minimum="$2"
-    [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" == "$minimum" ]]
 }
 
 export PATH="$INSTALL_PREFIX/bin:$SQLITE_PREFIX/bin:$PG_BINDIR:$PATH"
@@ -373,13 +487,13 @@ select_dependency() {
 
 print_dependency_policy() {
     cat <<EOF
-Dependency minimums (PostGIS 3.4):
+Dependency minimums (PostGIS ${POSTGIS_VERSION}):
   GEOS >= ${MIN_VERSION[geos]}
   PROJ >= ${MIN_VERSION[proj]}
   LibXML2 >= ${MIN_VERSION[libxml2]}
   JSON-C >= ${MIN_VERSION[json-c]}
-  GDAL >= ${MIN_VERSION[gdal]} (3.x preferred)
-  SFCGAL >= ${MIN_VERSION[sfcgal]} (1.4.1 recommended for all features)
+  GDAL >= ${MIN_VERSION[gdal]} (raster support)
+  SFCGAL >= ${MIN_VERSION[sfcgal]} (optional 3D support)
   protobuf-c >= ${MIN_VERSION[protobuf-c]}
   LLVM >= ${MIN_VERSION[llvm]} only when PostgreSQL was built with JIT
 EOF
@@ -431,8 +545,16 @@ cleanup() {
 trap cleanup EXIT
 
 extract() {
-    local archive="$1"
+    local component="$1" archive="${ARCHIVES[$1]}" listing first_entry top_dir
+    listing="$(tar -tf "$PACKAGES_DIR/$archive")"
+    first_entry="${listing%%$'\n'*}"
+    top_dir="${first_entry%%/*}"
+    [[ -n "$top_dir" && "$top_dir" != "." ]] ||
+        die "Cannot determine source directory in $archive"
     tar -xf "$PACKAGES_DIR/$archive" -C "$WORK_DIR"
+    [[ -d "$WORK_DIR/$top_dir" ]] ||
+        die "Expected source directory was not extracted: $WORK_DIR/$top_dir"
+    SOURCE_DIRS["$component"]="$WORK_DIR/$top_dir"
 }
 
 make_install() {
@@ -458,10 +580,47 @@ select_dependency USE_SYSTEM_SFCGAL sfcgal SFCGAL-devel "${MIN_VERSION[sfcgal]}"
 select_dependency USE_SYSTEM_PROTOBUF_C protobuf-c protobuf-c-devel "${MIN_VERSION[protobuf-c]}"
 select_dependency USE_SYSTEM_PCRE pcre pcre-devel 8.0
 
+# Download source fallbacks only after installed packages and enabled yum
+# repositories have both failed the version requirement.
+if ((USE_SYSTEM_CMAKE == 0)); then
+    ensure_source_archive cmake 3.13 CMake-3.30.2.tar.gz \
+        https://github.com/Kitware/CMake/releases/download/v3.30.2/cmake-3.30.2.tar.gz
+fi
+if ((USE_SYSTEM_GEOS == 0)); then
+    ensure_source_archive geos "${MIN_VERSION[geos]}" geos-3.9.5.tar.bz2 \
+        https://download.osgeo.org/geos/geos-3.9.5.tar.bz2
+fi
+if ((USE_SYSTEM_PROJ == 0)); then
+    ensure_source_archive sqlite 3.11.0 sqlite-autoconf-3460100.tar.gz \
+        https://www.sqlite.org/2024/sqlite-autoconf-3460100.tar.gz
+    ensure_source_archive proj "${MIN_VERSION[proj]}" proj-6.3.1.tar.gz \
+        https://download.osgeo.org/proj/proj-6.3.1.tar.gz
+fi
+if ((USE_SYSTEM_PROTOBUF_C == 0)); then
+    ensure_source_archive protobuf 3.0 protobuf-all-3.15.3.tar.gz \
+        https://github.com/protocolbuffers/protobuf/releases/download/v3.15.3/protobuf-all-3.15.3.tar.gz
+    ensure_source_archive protobuf-c "${MIN_VERSION[protobuf-c]}" protobuf-c-1.3.3.tar.gz \
+        https://github.com/protobuf-c/protobuf-c/releases/download/v1.3.3/protobuf-c-1.3.3.tar.gz
+fi
+if ((USE_SYSTEM_GDAL == 0)); then
+    ensure_source_archive gdal "${MIN_VERSION[gdal]}" gdal-3.0.4.tar.gz \
+        https://download.osgeo.org/gdal/3.0.4/gdal-3.0.4.tar.gz
+fi
+if ((USE_SYSTEM_SFCGAL == 0)); then
+    ensure_source_archive cgal 4.3 CGAL-4.14.3.tar.xz \
+        https://github.com/CGAL/cgal/releases/download/releases%2FCGAL-4.14.3/CGAL-4.14.3.tar.xz
+    ensure_source_archive sfcgal "${MIN_VERSION[sfcgal]}" SFCGAL-1.4.1.tar.gz \
+        https://gitlab.com/SFCGAL/SFCGAL/-/archive/v1.4.1/SFCGAL-v1.4.1.tar.gz
+fi
+if ((USE_SYSTEM_PCRE == 0)); then
+    ensure_source_archive pcre 8.0 pcre-8.45.tar.gz \
+        https://sourceforge.net/projects/pcre/files/pcre/8.45/pcre-8.45.tar.gz/download
+fi
+
 if ((USE_SYSTEM_CMAKE == 0)); then
     log "Building CMake"
-    extract "${ARCHIVES[cmake]}"
-    pushd "$WORK_DIR/CMake-3.30.2" >/dev/null
+    extract cmake
+    pushd "${SOURCE_DIRS[cmake]}" >/dev/null
     ./bootstrap --prefix="$INSTALL_PREFIX" --parallel="$JOBS" -- -DBUILD_TESTING=OFF
     make_install
     popd >/dev/null
@@ -469,17 +628,17 @@ fi
 
 if ((USE_SYSTEM_GEOS == 0)); then
     log "Building GEOS"
-    extract "${ARCHIVES[geos]}"
-    cmake -S "$WORK_DIR/geos-3.9.5" -B "$WORK_DIR/geos-3.9.5/build" \
+    extract geos
+    cmake -S "${SOURCE_DIRS[geos]}" -B "${SOURCE_DIRS[geos]}/build" \
         -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
-    cmake --build "$WORK_DIR/geos-3.9.5/build" --parallel "$JOBS"
-    cmake --install "$WORK_DIR/geos-3.9.5/build"
+    cmake --build "${SOURCE_DIRS[geos]}/build" --parallel "$JOBS"
+    cmake --install "${SOURCE_DIRS[geos]}/build"
 fi
 
 if ((USE_SYSTEM_PROJ == 0)); then
     log "Building SQLite (required by bundled PROJ)"
-    extract "${ARCHIVES[sqlite]}"
-    pushd "$WORK_DIR/sqlite-autoconf-3460100" >/dev/null
+    extract sqlite
+    pushd "${SOURCE_DIRS[sqlite]}" >/dev/null
     ./configure --prefix="$SQLITE_PREFIX"
     make_install
     popd >/dev/null
@@ -487,8 +646,8 @@ fi
 
 if ((USE_SYSTEM_PROJ == 0)); then
     log "Building PROJ"
-    extract "${ARCHIVES[proj]}"
-    pushd "$WORK_DIR/proj-6.3.1" >/dev/null
+    extract proj
+    pushd "${SOURCE_DIRS[proj]}" >/dev/null
     ./configure --prefix="$INSTALL_PREFIX"
     make_install
     popd >/dev/null
@@ -496,15 +655,15 @@ fi
 
 if ((USE_SYSTEM_PROTOBUF_C == 0)); then
     log "Building protobuf"
-    extract "${ARCHIVES[protobuf]}"
-    pushd "$WORK_DIR/protobuf-3.15.3" >/dev/null
+    extract protobuf
+    pushd "${SOURCE_DIRS[protobuf]}" >/dev/null
     ./configure --prefix="$INSTALL_PREFIX"
     make_install
     popd >/dev/null
 
     log "Building protobuf-c"
-    extract "${ARCHIVES[protobuf-c]}"
-    pushd "$WORK_DIR/protobuf-c-1.3.3" >/dev/null
+    extract protobuf-c
+    pushd "${SOURCE_DIRS[protobuf-c]}" >/dev/null
     ./configure --prefix="$INSTALL_PREFIX"
     make_install
     popd >/dev/null
@@ -512,8 +671,8 @@ fi
 
 if ((USE_SYSTEM_GDAL == 0)); then
     log "Building GDAL"
-    extract "${ARCHIVES[gdal]}"
-    pushd "$WORK_DIR/gdal-3.0.4" >/dev/null
+    extract gdal
+    pushd "${SOURCE_DIRS[gdal]}" >/dev/null
     ./configure --prefix="$INSTALL_PREFIX"
     make_install
     popd >/dev/null
@@ -521,24 +680,24 @@ fi
 
 if ((USE_SYSTEM_SFCGAL == 0)); then
     log "Building CGAL"
-    extract "${ARCHIVES[cgal]}"
-    cmake -S "$WORK_DIR/CGAL-4.14.3" -B "$WORK_DIR/CGAL-4.14.3/build" \
+    extract cgal
+    cmake -S "${SOURCE_DIRS[cgal]}" -B "${SOURCE_DIRS[cgal]}/build" \
         -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
-    cmake --build "$WORK_DIR/CGAL-4.14.3/build" --parallel "$JOBS"
-    cmake --install "$WORK_DIR/CGAL-4.14.3/build"
+    cmake --build "${SOURCE_DIRS[cgal]}/build" --parallel "$JOBS"
+    cmake --install "${SOURCE_DIRS[cgal]}/build"
 
     log "Building SFCGAL"
-    extract "${ARCHIVES[sfcgal]}"
-    cmake -S "$WORK_DIR/SFCGAL-1.3.7" -B "$WORK_DIR/SFCGAL-1.3.7/build" \
+    extract sfcgal
+    cmake -S "${SOURCE_DIRS[sfcgal]}" -B "${SOURCE_DIRS[sfcgal]}/build" \
         -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
-    cmake --build "$WORK_DIR/SFCGAL-1.3.7/build" --parallel "$JOBS"
-    cmake --install "$WORK_DIR/SFCGAL-1.3.7/build"
+    cmake --build "${SOURCE_DIRS[sfcgal]}/build" --parallel "$JOBS"
+    cmake --install "${SOURCE_DIRS[sfcgal]}/build"
 fi
 
 if ((USE_SYSTEM_PCRE == 0)); then
     log "Building PCRE"
-    extract "${ARCHIVES[pcre]}"
-    pushd "$WORK_DIR/pcre-8.45" >/dev/null
+    extract pcre
+    pushd "${SOURCE_DIRS[pcre]}" >/dev/null
     ./configure --prefix="$INSTALL_PREFIX"
     make_install
     popd >/dev/null
@@ -551,13 +710,13 @@ if [[ -f "$PG_PKGLIBDIR/postgis-3.so" && -r "$POSTGIS_CONTROL" ]]; then
         awk -F"'" '/^[[:space:]]*default_version[[:space:]]*=/{print $2; exit}' "$POSTGIS_CONTROL"
     )"
 fi
-if [[ -n "$POSTGIS_INSTALLED_VERSION" ]] && version_ge "$POSTGIS_INSTALLED_VERSION" 3.4.2; then
+if [[ -n "$POSTGIS_INSTALLED_VERSION" ]] && version_ge "$POSTGIS_INSTALLED_VERSION" "$POSTGIS_VERSION"; then
     log "Already installed: PostGIS ${POSTGIS_INSTALLED_VERSION}; skipping source build"
 else
     log "Building PostGIS for the existing PostgreSQL installation"
-    extract "${ARCHIVES[postgis]}"
-    pushd "$WORK_DIR/postgis-3.4.2" >/dev/null
-    ./configure --with-pgconfig="$PG_CONFIG" --without-raster
+    extract postgis
+    pushd "${SOURCE_DIRS[postgis]}" >/dev/null
+    ./configure --with-pgconfig="$PG_CONFIG"
     make_install
     popd >/dev/null
 fi

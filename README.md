@@ -1,8 +1,14 @@
 # PostGIS installer for PostgreSQL + Patroni
 
 本项目用于在 `postgresql17-ha-patroni-etcd` 已安装好的 PostgreSQL 节点上安装
-PostGIS 3.4.2。脚本只操作当前节点，不包含 SSH、SCP 或集群分发逻辑；需要在哪个
+PostGIS 3.6。脚本会自动选择 `packages/` 中 3.6 系列最高的稳定版本，不固定补丁
+版本；目录中没有 3.6 包且允许联网时，会从 PostGIS 官方稳定源自动发现并下载
+当前最高版本。脚本只操作当前节点，不包含 SSH、SCP 或集群分发逻辑；需要在哪个
 PostgreSQL 节点安装，就在哪个节点直接执行 `install.sh`。
+
+依赖的选择顺序固定为：已安装且版本满足 → 当前 yum 仓库中满足版本的 RPM →
+`packages/` 中满足版本的最高源码包 → 对应项目的官方稳定源码。可设置
+`AUTO_DOWNLOAD=0` 禁止联网下载。
 
 ## 目录
 
@@ -16,16 +22,16 @@ postgis-install/
 
 ## 依赖选择规则
 
-脚本按照 PostGIS 3.4 官方要求检查已启用的 yum 仓库：
+脚本按照自动选中的 PostGIS 版本检查依赖。PostGIS 3.6 的主要门槛如下：
 
 | 依赖 | 最低版本 | 选择规则 |
 |---|---:|---|
-| GEOS | 3.6 | 仓库版本满足时用 `geos-devel` |
+| GEOS | 3.8 | 仓库版本满足时用 `geos-devel` |
 | PROJ | 6.1 | 仓库版本满足时用 `proj-devel` |
 | LibXML2 | 2.5 | 使用满足要求的系统 RPM |
 | JSON-C | 0.9 | 使用满足要求的系统 RPM |
-| GDAL | 2.0 | 3.x 更佳；仓库版本不足时源码编译 |
-| SFCGAL | 1.3.1 | 1.4.1+ 可使用全部 SFCGAL 功能 |
+| GDAL | 3.0 | 仓库版本不足时源码编译 |
+| SFCGAL | 1.4.1 | 2.2+ 可使用全部 SFCGAL 功能 |
 | protobuf-c | 1.1.0 | 仓库版本不足时同时编译 protobuf |
 | LLVM | 6.0 | 仅 PostgreSQL 启用 JIT 时需要 |
 
@@ -51,7 +57,7 @@ packages/rpm/el8/x86_64/
 ```
 
 脚本会递归下载依赖，生成 `SHA256SUMS` 和环境清单。GIS RPM 只有达到 PostGIS
-3.4 最低版本才会下载；仓库版本过低或不存在时，`install.sh` 继续使用
+所选 PostGIS 最低版本才会下载；仓库版本过低或不存在时，`install.sh` 继续使用
 `packages/` 中对应的源码包。
 
 先做预检，查看 PostgreSQL 路径和 yum 候选版本：
