@@ -6,7 +6,8 @@ PostGIS 3.6。脚本会自动选择 `packages/` 中 3.6 系列最高的稳定版
 当前最高版本。脚本只操作当前节点，不包含 SSH、SCP 或集群分发逻辑；需要在哪个
 PostgreSQL 节点安装，就在哪个节点直接执行 `install.sh`。
 
-依赖的选择顺序固定为：已安装且版本满足 → 当前 yum 仓库中满足版本的 RPM →
+依赖默认安装到 postgres 家目录下的 `postgis-deps/`，不会覆盖 `/usr/local`
+里的系统库。依赖的选择顺序固定为：已安装且版本满足 → 当前 yum 仓库中满足版本的 RPM →
 `packages/` 中满足版本的最高源码包 → 对应项目的官方稳定源码。可设置
 `AUTO_DOWNLOAD=0` 禁止联网下载。
 
@@ -31,7 +32,7 @@ postgis-install/
 | LibXML2 | 2.5 | 使用满足要求的系统 RPM |
 | JSON-C | 0.9 | 使用满足要求的系统 RPM |
 | GDAL | 3.0 | 仓库版本不足时源码编译 |
-| SFCGAL | 1.4.1 | 2.2+ 可使用全部 SFCGAL 功能 |
+| SFCGAL | 1.4.1 | 要求 CGAL ≥ 5.3；2.2+ 可使用全部 SFCGAL 功能 |
 | protobuf-c | 1.1.0 | 仓库版本不足时同时编译 protobuf |
 | LLVM | 6.0 | 仅 PostgreSQL 启用 JIT 时需要 |
 

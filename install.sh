@@ -40,7 +40,7 @@ The script must run as root and switches to the PostgreSQL OS user internally
 for environment discovery and database commands.
 
 Options:
-  -i, --prefix DIR          Dependency installation prefix (default: /usr/local)
+  -i, --prefix DIR          Dependency prefix (default: POSTGRES_HOME/postgis-deps)
   -s, --sqlite-prefix DIR   SQLite installation prefix (default: PREFIX/sqlite)
   -p, --pg-config FILE      Existing PostgreSQL pg_config path
   -d, --database NAME       Database used for CREATE EXTENSION (default: postgres)
@@ -152,8 +152,12 @@ load_pg_environment() {
 }
 load_pg_environment
 
-# Apply defaults only after postgres environment discovery.
-INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
+# Apply defaults only after postgres environment discovery. Dependencies are
+# private to the PostgreSQL OS account instead of modifying /usr/local.
+PG_OS_HOME="$(getent passwd "$PG_USER" | cut -d: -f6)"
+[[ -n "$PG_OS_HOME" && -d "$PG_OS_HOME" ]] ||
+    die "Home directory for PostgreSQL OS user ${PG_USER} was not found"
+INSTALL_PREFIX="${INSTALL_PREFIX:-${PG_OS_HOME}/postgis-deps}"
 SQLITE_PREFIX="${SQLITE_PREFIX:-${INSTALL_PREFIX}/sqlite}"
 PACKAGES_DIR="${PACKAGES_DIR:-${SCRIPT_DIR}/packages}"
 PGDATABASE="${PGDATABASE:-postgres}"
@@ -358,8 +362,9 @@ fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "JOBS must be a positive integer"
 
 log "Detected ${PRETTY_NAME}"
-printf 'PostgreSQL: %s\npg_config: %s\npkglibdir: %s\nsharedir: %s\npackages: %s\n' \
-    "$("$PG_CONFIG" --version)" "$PG_CONFIG" "$PG_PKGLIBDIR" "$PG_SHAREDIR" "$PACKAGES_DIR"
+printf 'PostgreSQL: %s\npg_config: %s\npkglibdir: %s\nsharedir: %s\npackages: %s\nprivate dependencies: %s\n' \
+    "$("$PG_CONFIG" --version)" "$PG_CONFIG" "$PG_PKGLIBDIR" "$PG_SHAREDIR" \
+    "$PACKAGES_DIR" "$INSTALL_PREFIX"
 install_os_dependencies() {
     local -a packages=(
         gcc gcc-c++ make autoconf automake libtool
@@ -388,8 +393,9 @@ install_os_dependencies() {
 export PATH="$INSTALL_PREFIX/bin:$SQLITE_PREFIX/bin:$PG_BINDIR:$PATH"
 export PKG_CONFIG_PATH="$SQLITE_PREFIX/lib/pkgconfig:$INSTALL_PREFIX/lib64/pkgconfig:$INSTALL_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export LD_LIBRARY_PATH="$INSTALL_PREFIX/lib64:$INSTALL_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CMAKE_PREFIX_PATH="$INSTALL_PREFIX:$SQLITE_PREFIX:${CMAKE_PREFIX_PATH:-}"
 export CPPFLAGS="-I$INSTALL_PREFIX/include ${CPPFLAGS:-}"
-export LDFLAGS="-L$INSTALL_PREFIX/lib64 -L$INSTALL_PREFIX/lib ${LDFLAGS:-}"
+export LDFLAGS="-L$INSTALL_PREFIX/lib64 -L$INSTALL_PREFIX/lib -Wl,-rpath,$INSTALL_PREFIX/lib64 -Wl,-rpath,$INSTALL_PREFIX/lib ${LDFLAGS:-}"
 
 extract_numeric_version() {
     grep -Eo '[0-9]+([.][0-9]+)+' | head -n1 || true
@@ -536,6 +542,10 @@ fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/postgis-install.XXXXXX")"
 cleanup() {
+    if [[ -d "$INSTALL_PREFIX" ]]; then
+        chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$INSTALL_PREFIX" || true
+        chmod 0750 "$INSTALL_PREFIX" || true
+    fi
     if [[ "$KEEP_BUILD" == 1 ]]; then
         log "Build directory retained: $WORK_DIR"
     else
@@ -563,6 +573,8 @@ make_install() {
 }
 
 install_os_dependencies
+install -d -m 0750 -o "$PG_USER" -g "$(id -gn "$PG_USER")" \
+    "$INSTALL_PREFIX" "$SQLITE_PREFIX"
 
 USE_SYSTEM_GEOS=0
 USE_SYSTEM_PROJ=0
@@ -607,8 +619,8 @@ if ((USE_SYSTEM_GDAL == 0)); then
         https://download.osgeo.org/gdal/3.0.4/gdal-3.0.4.tar.gz
 fi
 if ((USE_SYSTEM_SFCGAL == 0)); then
-    ensure_source_archive cgal 4.3 CGAL-4.14.3.tar.xz \
-        https://github.com/CGAL/cgal/releases/download/releases%2FCGAL-4.14.3/CGAL-4.14.3.tar.xz
+    ensure_source_archive cgal 5.3 CGAL-5.3.2.tar.xz \
+        https://github.com/CGAL/cgal/releases/download/v5.3.2/CGAL-5.3.2.tar.xz
     ensure_source_archive sfcgal "${MIN_VERSION[sfcgal]}" SFCGAL-1.4.1.tar.gz \
         https://gitlab.com/SFCGAL/SFCGAL/-/archive/v1.4.1/SFCGAL-v1.4.1.tar.gz
 fi
@@ -682,14 +694,32 @@ if ((USE_SYSTEM_SFCGAL == 0)); then
     log "Building CGAL"
     extract cgal
     cmake -S "${SOURCE_DIRS[cgal]}" -B "${SOURCE_DIRS[cgal]}/build" \
-        -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+        -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+        -DCMAKE_INSTALL_RPATH="$INSTALL_PREFIX/lib64;$INSTALL_PREFIX/lib"
     cmake --build "${SOURCE_DIRS[cgal]}/build" --parallel "$JOBS"
     cmake --install "${SOURCE_DIRS[cgal]}/build"
 
     log "Building SFCGAL"
+    CGAL_DIR="$(
+        find "$INSTALL_PREFIX" -type f -name CGALConfig.cmake -printf '%h\n' 2>/dev/null |
+            head -n1
+    )"
+    [[ -n "$CGAL_DIR" ]] ||
+        die "CGALConfig.cmake was not installed below $INSTALL_PREFIX"
+    CGAL_CONFIG_VERSION="$(
+        awk -F'"' '/set[(]CGAL_VERSION /{print $2; exit}' "$CGAL_DIR/CGALConfigVersion.cmake" 2>/dev/null ||
+            true
+    )"
+    [[ -z "$CGAL_CONFIG_VERSION" ]] || version_ge "$CGAL_CONFIG_VERSION" 5.3 ||
+        die "Private CGAL ${CGAL_CONFIG_VERSION} is below SFCGAL requirement 5.3"
     extract sfcgal
     cmake -S "${SOURCE_DIRS[sfcgal]}" -B "${SOURCE_DIRS[sfcgal]}/build" \
-        -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+        -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+        -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX;$SQLITE_PREFIX" \
+        -DCGAL_DIR="$CGAL_DIR" \
+        -DCMAKE_INSTALL_RPATH="$INSTALL_PREFIX/lib64;$INSTALL_PREFIX/lib"
     cmake --build "${SOURCE_DIRS[sfcgal]}/build" --parallel "$JOBS"
     cmake --install "${SOURCE_DIRS[sfcgal]}/build"
 fi
@@ -721,12 +751,8 @@ else
     popd >/dev/null
 fi
 
-cat > /etc/ld.so.conf.d/postgis-local.conf <<EOF
-$INSTALL_PREFIX/lib
-$INSTALL_PREFIX/lib64
-$SQLITE_PREFIX/lib
-EOF
-ldconfig
+chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$INSTALL_PREFIX"
+chmod 0750 "$INSTALL_PREFIX"
 chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$PG_PKGLIBDIR" "$PG_SHAREDIR/extension"
 
 pg_env=(env "PATH=$PG_BINDIR:$PATH")
