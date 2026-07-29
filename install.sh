@@ -46,6 +46,7 @@ for environment discovery and database commands.
 Options:
   -i, --prefix DIR          Dependency prefix (default: POSTGRES_HOME/postgis-deps)
   -s, --sqlite-prefix DIR   SQLite installation prefix (default: PREFIX/sqlite)
+      --pg-home DIR         Target PostgreSQL installation prefix
   -p, --pg-config FILE      Existing PostgreSQL pg_config path
   -d, --database NAME       Database used for CREATE EXTENSION (default: postgres)
       --create-extension    Always create the extension (must run on leader)
@@ -77,6 +78,7 @@ while (($#)); do
     case "$1" in
         -i|--prefix) require_option_value "$@"; INSTALL_PREFIX="$2"; shift 2 ;;
         -s|--sqlite-prefix) require_option_value "$@"; SQLITE_PREFIX="$2"; shift 2 ;;
+        --pg-home) require_option_value "$@"; PGHOME="$2"; shift 2 ;;
         -p|--pg-config)
             require_option_value "$@"
             PG_CONFIG="$2"
@@ -96,6 +98,14 @@ while (($#)); do
         *) die "Unknown option: $1 (use --help)" ;;
     esac
 done
+
+PGHOME_EXPLICIT=0
+PG_CONFIG_EXPLICIT=0
+[[ -n "$PGHOME" ]] && PGHOME_EXPLICIT=1
+[[ -n "$PG_CONFIG" ]] && PG_CONFIG_EXPLICIT=1
+if ((PGHOME_EXPLICIT)) && [[ -z "$PG_CONFIG" ]]; then
+    PG_CONFIG="${PGHOME%/}/bin/pg_config"
+fi
 
 [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo ./install.sh"
 [[ -r /etc/os-release ]] || die "/etc/os-release not found"
@@ -180,9 +190,9 @@ find_pg_config() {
     local candidate version
     local -a candidates=()
     [[ -n "$PG_CONFIG" ]] && candidates+=("$PG_CONFIG")
-    [[ -n "$PG_LOGIN_PG_CONFIG" ]] && candidates+=("$PG_LOGIN_PG_CONFIG")
-    [[ -n "${PGBIN:-}" ]] && candidates+=("${PGBIN%/}/pg_config")
     [[ -n "${PGHOME:-}" ]] && candidates+=("${PGHOME%/}/bin/pg_config")
+    [[ -n "${PGBIN:-}" ]] && candidates+=("${PGBIN%/}/pg_config")
+    [[ -n "$PG_LOGIN_PG_CONFIG" ]] && candidates+=("$PG_LOGIN_PG_CONFIG")
     candidates+=(
         /home/postgres/pghome/bin/pg_config
         /home/postgres/pg/bin/pg_config
@@ -207,6 +217,18 @@ find_pg_config() {
 
 find_pg_config || die "PostgreSQL pg_config not found. Set PG_CONFIG or use --pg-config."
 readonly PG_CONFIG
+PG_CONFIG_PREFIX="$("$PG_CONFIG" --prefix)"
+[[ -d "$PG_CONFIG_PREFIX" ]] ||
+    die "Selected pg_config returned a missing PostgreSQL prefix: $PG_CONFIG_PREFIX"
+if ((PGHOME_EXPLICIT)); then
+    [[ "$(readlink -f "$PGHOME")" == "$(readlink -f "$PG_CONFIG_PREFIX")" ]] ||
+        die "Specified PGHOME ($PGHOME) does not match pg_config prefix ($PG_CONFIG_PREFIX)"
+fi
+if ((PG_CONFIG_EXPLICIT)) || ((PGHOME_EXPLICIT == 0)); then
+    PGHOME="$(readlink -f "$PG_CONFIG_PREFIX")"
+fi
+export PGHOME
+readonly PGHOME
 readonly PG_BINDIR="$("$PG_CONFIG" --bindir)"
 readonly PG_PKGLIBDIR="$("$PG_CONFIG" --pkglibdir)"
 readonly PG_SHAREDIR="$("$PG_CONFIG" --sharedir)"
@@ -874,9 +896,21 @@ pushd "${SOURCE_DIRS[postgis]}" >/dev/null
     --with-geosconfig="$INSTALL_PREFIX/bin/geos-config" \
     --with-projdir="$INSTALL_PREFIX" \
     --with-gdalconfig="$INSTALL_PREFIX/bin/gdal-config" \
-    --with-sfcgal="$INSTALL_PREFIX"
+    --with-sfcgal="$INSTALL_PREFIX/bin/sfcgal-config"
 make_install
 popd >/dev/null
+
+POSTGIS_CONTROL="$PG_SHAREDIR/extension/postgis.control"
+POSTGIS_LIBRARY="$PG_PKGLIBDIR/postgis-3.so"
+[[ -s "$POSTGIS_LIBRARY" ]] ||
+    die "PostGIS library was not installed into selected PGHOME: $POSTGIS_LIBRARY"
+[[ -r "$POSTGIS_CONTROL" ]] ||
+    die "PostGIS control file was not installed into selected PGHOME: $POSTGIS_CONTROL"
+INSTALLED_CONTROL_VERSION="$(
+    awk -F"'" '/^[[:space:]]*default_version[[:space:]]*=/{print $2; exit}' "$POSTGIS_CONTROL"
+)"
+[[ "$INSTALLED_CONTROL_VERSION" == "$POSTGIS_VERSION" ]] ||
+    die "Selected PGHOME still exposes PostGIS ${INSTALLED_CONTROL_VERSION:-unknown}; expected $POSTGIS_VERSION"
 
 chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$INSTALL_PREFIX"
 chmod 0750 "$INSTALL_PREFIX"
@@ -903,11 +937,42 @@ case "$CREATE_EXTENSION" in
 esac
 
 if ((create_now)); then
-    log "Creating/updating postgis extension in ${PGDATABASE:-postgres}"
+    log "Creating postgis extension in ${PGDATABASE:-postgres} when absent"
     sudo -iu "$PG_USER" "${pg_env[@]}" \
         "$PG_BINDIR/psql" -v ON_ERROR_STOP=1 -d "${PGDATABASE:-postgres}" \
-        -c 'CREATE EXTENSION IF NOT EXISTS postgis;' \
-        -c 'ALTER EXTENSION postgis UPDATE;'
+        -c 'CREATE EXTENSION IF NOT EXISTS postgis;'
+
+    log "Aligning existing PostGIS extensions in all connectable databases to ${POSTGIS_VERSION}"
+    while IFS= read -r database_name; do
+        [[ -n "$database_name" ]] || continue
+        extension_version="$(
+            sudo -iu "$PG_USER" "${pg_env[@]}" \
+                "$PG_BINDIR/psql" -XAtq -d "$database_name" \
+                -c "SELECT extversion FROM pg_extension WHERE extname = 'postgis'" 2>/dev/null ||
+                true
+        )"
+        [[ -n "$extension_version" ]] || continue
+        if [[ "$extension_version" != "$POSTGIS_VERSION" ]]; then
+            log "Upgrading ${database_name}: postgis ${extension_version} -> ${POSTGIS_VERSION}"
+            sudo -iu "$PG_USER" "${pg_env[@]}" \
+                "$PG_BINDIR/psql" -X -v ON_ERROR_STOP=1 -d "$database_name" \
+                -c "ALTER EXTENSION postgis UPDATE TO '${POSTGIS_VERSION}';"
+        fi
+        sudo -iu "$PG_USER" "${pg_env[@]}" \
+            "$PG_BINDIR/psql" -X -v ON_ERROR_STOP=1 -d "$database_name" \
+            -c 'SELECT postgis_extensions_upgrade();'
+        binary_version="$(
+            sudo -iu "$PG_USER" "${pg_env[@]}" \
+                "$PG_BINDIR/psql" -XAtq -d "$database_name" \
+                -c 'SELECT postgis_lib_version()'
+        )"
+        [[ "$binary_version" == "$POSTGIS_VERSION" ]] ||
+            die "${database_name} loaded PostGIS binary ${binary_version}; expected ${POSTGIS_VERSION}"
+    done < <(
+        sudo -iu "$PG_USER" "${pg_env[@]}" \
+            "$PG_BINDIR/psql" -XAtq -d "${PGDATABASE:-postgres}" \
+            -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname"
+    )
 else
     log "Extension SQL skipped on this replica; it is replicated from the Patroni leader"
 fi
