@@ -815,7 +815,12 @@ if ((USE_SYSTEM_GDAL == 0)); then
     log "Building GDAL"
     extract gdal
     pushd "${SOURCE_DIRS[gdal]}" >/dev/null
-    ./configure --prefix="$INSTALL_PREFIX"
+    # JasPer/JPEG2000 is optional for PostGIS raster and jasper-devel is not
+    # consistently available on EL7/EL8. Disable it to keep both platforms
+    # reproducible while retaining the core PostGIS raster functionality.
+    ./configure \
+        --prefix="$INSTALL_PREFIX" \
+        --without-jasper
     make_install
     popd >/dev/null
 fi
