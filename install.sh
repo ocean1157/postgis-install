@@ -47,13 +47,14 @@ Options:
       --create-extension    Always create the extension (must run on leader)
       --no-create-extension Do not create the extension
       --check               Validate OS, packages and PostgreSQL paths only
-      --source-only         Do not use dependency packages from enabled yum repos
+      --source-only         Compatibility option; private GIS dependencies always use source
   -j, --jobs N              Parallel build jobs
   -h, --help                Show this help
 
 Environment overrides: PG_CONFIG, PGHOME, PGBIN, PGPORT, PGDATABASE,
 INSTALL_PREFIX, SQLITE_PREFIX, PACKAGES_DIR, JOBS, CREATE_EXTENSION,
-PREFER_YUM, AUTO_DOWNLOAD and POSTGIS_SERIES.
+AUTO_DOWNLOAD and POSTGIS_SERIES. PREFER_YUM is retained for compatibility;
+GIS dependencies are always installed into the postgres-private prefix.
 EOF
 }
 
@@ -584,16 +585,13 @@ USE_SYSTEM_PROTOBUF_C=0
 USE_SYSTEM_PCRE=0
 USE_SYSTEM_CMAKE=0
 
-select_dependency USE_SYSTEM_CMAKE cmake cmake 3.13
-select_dependency USE_SYSTEM_GEOS geos geos-devel "${MIN_VERSION[geos]}"
-select_dependency USE_SYSTEM_PROJ proj proj-devel "${MIN_VERSION[proj]}"
-select_dependency USE_SYSTEM_GDAL gdal gdal-devel "${MIN_VERSION[gdal]}"
-select_dependency USE_SYSTEM_SFCGAL sfcgal SFCGAL-devel "${MIN_VERSION[sfcgal]}"
-select_dependency USE_SYSTEM_PROTOBUF_C protobuf-c protobuf-c-devel "${MIN_VERSION[protobuf-c]}"
-select_dependency USE_SYSTEM_PCRE pcre pcre-devel 8.0
+log "System GIS libraries are not linked into PostGIS"
+log "Reinstalling private dependencies from packages/ into ${INSTALL_PREFIX}"
+log "Existing files in the private prefix will be overwritten in place"
 
-# Download source fallbacks only after installed packages and enabled yum
-# repositories have both failed the version requirement.
+# Every GIS dependency is installed privately even if the host has a usable
+# system copy. Existing private files are overwritten by make install, which
+# keeps reruns safe without deleting libraries from under a running postgres.
 if ((USE_SYSTEM_CMAKE == 0)); then
     ensure_source_archive cmake 3.13 CMake-3.30.2.tar.gz \
         https://github.com/Kitware/CMake/releases/download/v3.30.2/cmake-3.30.2.tar.gz
@@ -733,23 +731,17 @@ if ((USE_SYSTEM_PCRE == 0)); then
     popd >/dev/null
 fi
 
-POSTGIS_CONTROL="$PG_SHAREDIR/extension/postgis.control"
-POSTGIS_INSTALLED_VERSION=""
-if [[ -f "$PG_PKGLIBDIR/postgis-3.so" && -r "$POSTGIS_CONTROL" ]]; then
-    POSTGIS_INSTALLED_VERSION="$(
-        awk -F"'" '/^[[:space:]]*default_version[[:space:]]*=/{print $2; exit}' "$POSTGIS_CONTROL"
-    )"
-fi
-if [[ -n "$POSTGIS_INSTALLED_VERSION" ]] && version_ge "$POSTGIS_INSTALLED_VERSION" "$POSTGIS_VERSION"; then
-    log "Already installed: PostGIS ${POSTGIS_INSTALLED_VERSION}; skipping source build"
-else
-    log "Building PostGIS for the existing PostgreSQL installation"
-    extract postgis
-    pushd "${SOURCE_DIRS[postgis]}" >/dev/null
-    ./configure --with-pgconfig="$PG_CONFIG"
-    make_install
-    popd >/dev/null
-fi
+log "Rebuilding PostGIS against the postgres-private dependency prefix"
+extract postgis
+pushd "${SOURCE_DIRS[postgis]}" >/dev/null
+./configure \
+    --with-pgconfig="$PG_CONFIG" \
+    --with-geosconfig="$INSTALL_PREFIX/bin/geos-config" \
+    --with-projdir="$INSTALL_PREFIX" \
+    --with-gdalconfig="$INSTALL_PREFIX/bin/gdal-config" \
+    --with-sfcgal="$INSTALL_PREFIX"
+make_install
+popd >/dev/null
 
 chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$INSTALL_PREFIX"
 chmod 0750 "$INSTALL_PREFIX"
