@@ -231,15 +231,36 @@ declare -A ARCHIVES=()
 declare -A ARCHIVE_VERSIONS=()
 declare -A SOURCE_DIRS=()
 
+verify_bundled_checksums() {
+    local manifest="$PACKAGES_DIR/SHA256SUMS" expected filename actual
+    [[ -r "$manifest" ]] || return 0
+    while read -r expected filename; do
+        [[ -n "$expected" && -n "$filename" ]] || continue
+        [[ -e "$PACKAGES_DIR/$filename" ]] || continue
+        actual="$(sha256sum "$PACKAGES_DIR/$filename" | awk '{print $1}')"
+        [[ "$actual" == "$expected" ]] ||
+            die "Checksum mismatch: packages/$filename"
+    done < "$manifest"
+    log "Existing bundled source archives passed SHA256 verification"
+}
+verify_bundled_checksums
+
 archive_version() {
-    local component="$1" filename="$2"
+    local component="$1" filename="$2" encoded
     case "$component:$filename" in
         cmake:CMake-*.tar.gz|cmake:cmake-*.tar.gz)
             filename="${filename#*-}"; printf '%s\n' "${filename%.tar.gz}" ;;
         geos:geos-*.tar.bz2)
             filename="${filename#geos-}"; printf '%s\n' "${filename%.tar.bz2}" ;;
         sqlite:sqlite-autoconf-*.tar.gz)
-            filename="${filename#sqlite-autoconf-}"; printf '%s\n' "${filename%.tar.gz}" ;;
+            encoded="${filename#sqlite-autoconf-}"
+            encoded="${encoded%.tar.gz}"
+            [[ "$encoded" =~ ^[0-9]{7}$ ]] || return 1
+            printf '%d.%d.%d\n' \
+                "$((10#${encoded:0:1}))" \
+                "$((10#${encoded:1:2}))" \
+                "$((10#${encoded:3:2}))"
+            ;;
         proj:proj-*.tar.gz)
             filename="${filename#proj-}"; printf '%s\n' "${filename%.tar.gz}" ;;
         protobuf:protobuf-all-*.tar.gz)
@@ -277,6 +298,9 @@ select_highest_archive() {
         fi
     done < <(find "$PACKAGES_DIR" -maxdepth 1 -type f -print)
     [[ -n "$best_file" ]] || return 1
+    [[ -s "$PACKAGES_DIR/$best_file" ]] || return 1
+    tar -tf "$PACKAGES_DIR/$best_file" >/dev/null 2>&1 ||
+        die "Local source archive is corrupt or incomplete: packages/$best_file"
     ARCHIVES["$component"]="$best_file"
     ARCHIVE_VERSIONS["$component"]="$best_version"
 }
@@ -298,7 +322,11 @@ download_file() {
 
 ensure_source_archive() {
     local component="$1" minimum="$2" fallback_file="$3" url="$4"
-    select_highest_archive "$component" "$minimum" && return 0
+    if select_highest_archive "$component" "$minimum"; then
+        log "Local source selected: ${ARCHIVES[$component]} (${component} ${ARCHIVE_VERSIONS[$component]})"
+        return 0
+    fi
+    log "No valid local ${component} archive satisfies >= ${minimum}"
     download_file "$url" "$PACKAGES_DIR/$fallback_file"
     select_highest_archive "$component" "$minimum" ||
         die "Downloaded source does not satisfy ${component} >= ${minimum}"
