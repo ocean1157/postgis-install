@@ -15,7 +15,7 @@ INSTALL_PREFIX="${INSTALL_PREFIX:-}"
 SQLITE_PREFIX="${SQLITE_PREFIX:-}"
 PACKAGES_DIR="${PACKAGES_DIR:-}"
 JOBS="${JOBS:-}"
-BUILD_RETRIES="${BUILD_RETRIES:-5}"
+BUILD_RETRIES="${BUILD_RETRIES:-1}"
 AUTO_SWAP="${AUTO_SWAP:-1}"
 SWAP_SIZE_MB="${SWAP_SIZE_MB:-4096}"
 MIN_BUILD_MEMORY_MB="${MIN_BUILD_MEMORY_MB:-4096}"
@@ -53,7 +53,7 @@ Options:
       --check               Validate OS, packages and PostgreSQL paths only
       --source-only         Compatibility option; private GIS dependencies always use source
   -j, --jobs N              Parallel build jobs
-      --retries N           Build attempts; halves jobs after failure (default: 5)
+      --retries N           Retries after build failure (default: 1; 0 disables)
       --swap-size MB        Temporary swap size when memory is low (default: 4096)
       --no-auto-swap        Do not create temporary build swap
   -h, --help                Show this help
@@ -400,8 +400,8 @@ if [[ -z "$JOBS" ]]; then
     JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "JOBS must be a positive integer"
-[[ "$BUILD_RETRIES" =~ ^[1-9][0-9]*$ ]] ||
-    die "BUILD_RETRIES must be a positive integer"
+[[ "$BUILD_RETRIES" =~ ^[0-9]+$ ]] ||
+    die "BUILD_RETRIES must be a non-negative integer"
 [[ "$SWAP_SIZE_MB" =~ ^[1-9][0-9]*$ ]] ||
     die "SWAP_SIZE_MB must be a positive integer"
 [[ "$MIN_BUILD_MEMORY_MB" =~ ^[1-9][0-9]*$ ]] ||
@@ -637,9 +637,10 @@ make_install() {
 
 retry_parallel_command() {
     local label="$1" mode="$2" target="$3"
-    local attempt=1 current_jobs="$JOBS" status
+    local attempt=1 total_attempts=$((BUILD_RETRIES + 1))
+    local current_jobs="$JOBS" status
     while :; do
-        log "${label}: build attempt ${attempt}/${BUILD_RETRIES}, jobs=${current_jobs}"
+        log "${label}: build attempt ${attempt}/${total_attempts}, jobs=${current_jobs}"
         if [[ "$mode" == make ]]; then
             if make -j "$current_jobs"; then status=0; else status=$?; fi
         else
@@ -652,8 +653,8 @@ retry_parallel_command() {
         if ((status == 0)); then
             return 0
         fi
-        if ((attempt >= BUILD_RETRIES)); then
-            die "${label} build failed after ${BUILD_RETRIES} attempts"
+        if ((attempt >= total_attempts)); then
+            die "${label} build failed after ${attempt} attempt(s) and ${BUILD_RETRIES} retry/retries"
         fi
         if ((current_jobs > 1)); then
             current_jobs=$(((current_jobs + 1) / 2))
