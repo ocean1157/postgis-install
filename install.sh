@@ -15,6 +15,10 @@ INSTALL_PREFIX="${INSTALL_PREFIX:-}"
 SQLITE_PREFIX="${SQLITE_PREFIX:-}"
 PACKAGES_DIR="${PACKAGES_DIR:-}"
 JOBS="${JOBS:-}"
+BUILD_RETRIES="${BUILD_RETRIES:-5}"
+AUTO_SWAP="${AUTO_SWAP:-1}"
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-4096}"
+MIN_BUILD_MEMORY_MB="${MIN_BUILD_MEMORY_MB:-4096}"
 CREATE_EXTENSION="${CREATE_EXTENSION:-}"
 KEEP_BUILD="${KEEP_BUILD:-0}"
 PREFER_YUM="${PREFER_YUM:-1}"
@@ -49,10 +53,14 @@ Options:
       --check               Validate OS, packages and PostgreSQL paths only
       --source-only         Compatibility option; private GIS dependencies always use source
   -j, --jobs N              Parallel build jobs
+      --retries N           Build attempts; halves jobs after failure (default: 5)
+      --swap-size MB        Temporary swap size when memory is low (default: 4096)
+      --no-auto-swap        Do not create temporary build swap
   -h, --help                Show this help
 
 Environment overrides: PG_CONFIG, PGHOME, PGBIN, PGPORT, PGDATABASE,
-INSTALL_PREFIX, SQLITE_PREFIX, PACKAGES_DIR, JOBS, CREATE_EXTENSION,
+INSTALL_PREFIX, SQLITE_PREFIX, PACKAGES_DIR, JOBS, BUILD_RETRIES, AUTO_SWAP,
+SWAP_SIZE_MB, MIN_BUILD_MEMORY_MB, CREATE_EXTENSION,
 AUTO_DOWNLOAD and POSTGIS_SERIES. PREFER_YUM is retained for compatibility;
 GIS dependencies are always installed into the postgres-private prefix.
 EOF
@@ -77,6 +85,9 @@ while (($#)); do
             ;;
         -d|--database) require_option_value "$@"; PGDATABASE="$2"; shift 2 ;;
         -j|--jobs) require_option_value "$@"; JOBS="$2"; shift 2 ;;
+        --retries) require_option_value "$@"; BUILD_RETRIES="$2"; shift 2 ;;
+        --swap-size) require_option_value "$@"; SWAP_SIZE_MB="$2"; shift 2 ;;
+        --no-auto-swap) AUTO_SWAP=0; shift ;;
         --create-extension) CREATE_EXTENSION=always; shift ;;
         --no-create-extension) CREATE_EXTENSION=never; shift ;;
         --check) CHECK_ONLY=1; shift ;;
@@ -389,6 +400,14 @@ if [[ -z "$JOBS" ]]; then
     JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "JOBS must be a positive integer"
+[[ "$BUILD_RETRIES" =~ ^[1-9][0-9]*$ ]] ||
+    die "BUILD_RETRIES must be a positive integer"
+[[ "$SWAP_SIZE_MB" =~ ^[1-9][0-9]*$ ]] ||
+    die "SWAP_SIZE_MB must be a positive integer"
+[[ "$MIN_BUILD_MEMORY_MB" =~ ^[1-9][0-9]*$ ]] ||
+    die "MIN_BUILD_MEMORY_MB must be a positive integer"
+[[ "$AUTO_SWAP" == 0 || "$AUTO_SWAP" == 1 ]] ||
+    die "AUTO_SWAP must be 0 or 1"
 
 log "Detected ${PRETTY_NAME}"
 printf 'PostgreSQL: %s\npg_config: %s\npkglibdir: %s\nsharedir: %s\npackages: %s\nprivate dependencies: %s\n' \
@@ -570,6 +589,8 @@ if ((CHECK_ONLY)); then
 fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/postgis-install.XXXXXX")"
+TEMP_SWAP_FILE=""
+TEMP_SWAP_ACTIVE=0
 cleanup() {
     if [[ -d "$INSTALL_PREFIX" ]]; then
         chown -R "$PG_USER":"$(id -gn "$PG_USER")" "$INSTALL_PREFIX" || true
@@ -579,6 +600,19 @@ cleanup() {
         log "Build directory retained: $WORK_DIR"
     else
         rm -rf -- "$WORK_DIR"
+    fi
+    if [[ -n "$TEMP_SWAP_FILE" && -e "$TEMP_SWAP_FILE" ]]; then
+        if ((TEMP_SWAP_ACTIVE == 0)); then
+            rm -f -- "$TEMP_SWAP_FILE"
+        else
+            log "Disabling temporary build swap: $TEMP_SWAP_FILE"
+            if swapoff "$TEMP_SWAP_FILE"; then
+                TEMP_SWAP_ACTIVE=0
+                rm -f -- "$TEMP_SWAP_FILE"
+            else
+                log "WARNING: temporary swap is still in use and was retained: $TEMP_SWAP_FILE"
+            fi
+        fi
     fi
 }
 trap cleanup EXIT
@@ -597,11 +631,81 @@ extract() {
 }
 
 make_install() {
-    make -j "$JOBS"
+    retry_make
     make install
 }
 
+retry_parallel_command() {
+    local label="$1" mode="$2" target="$3"
+    local attempt=1 current_jobs="$JOBS" status
+    while :; do
+        log "${label}: build attempt ${attempt}/${BUILD_RETRIES}, jobs=${current_jobs}"
+        if [[ "$mode" == make ]]; then
+            if make -j "$current_jobs"; then status=0; else status=$?; fi
+        else
+            if cmake --build "$target" --parallel "$current_jobs"; then
+                status=0
+            else
+                status=$?
+            fi
+        fi
+        if ((status == 0)); then
+            return 0
+        fi
+        if ((attempt >= BUILD_RETRIES)); then
+            die "${label} build failed after ${BUILD_RETRIES} attempts"
+        fi
+        if ((current_jobs > 1)); then
+            current_jobs=$(((current_jobs + 1) / 2))
+        fi
+        log "${label}: build failed (exit ${status}); retrying with jobs=${current_jobs}"
+        attempt=$((attempt + 1))
+    done
+}
+
+retry_make() {
+    retry_parallel_command "make" make ""
+}
+
+cmake_build_install() {
+    local label="$1" build_dir="$2"
+    retry_parallel_command "$label" cmake "$build_dir"
+    cmake --install "$build_dir"
+}
+
 install_os_dependencies
+
+prepare_temporary_swap() {
+    local available_kb swap_free_kb effective_mb swap_dir free_mb
+    [[ "$AUTO_SWAP" == 1 ]] || return 0
+    available_kb="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+    swap_free_kb="$(awk '/^SwapFree:/{print $2}' /proc/meminfo)"
+    effective_mb=$(((available_kb + swap_free_kb) / 1024))
+    if ((effective_mb >= MIN_BUILD_MEMORY_MB)); then
+        log "Memory preflight: ${effective_mb} MiB available including swap; temporary swap not needed"
+        return 0
+    fi
+
+    command -v mkswap >/dev/null 2>&1 || die "mkswap is required for automatic swap"
+    command -v swapon >/dev/null 2>&1 || die "swapon is required for automatic swap"
+    swap_dir="${TMP_SWAP_DIR:-/var/tmp}"
+    free_mb="$(df -Pm "$swap_dir" | awk 'NR==2{print $4}')"
+    ((free_mb > SWAP_SIZE_MB + 256)) ||
+        die "Not enough free disk space in ${swap_dir} for ${SWAP_SIZE_MB} MiB temporary swap"
+    TEMP_SWAP_FILE="$(mktemp "${swap_dir%/}/postgis-install.swap.XXXXXX")"
+    chmod 0600 "$TEMP_SWAP_FILE"
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${SWAP_SIZE_MB}M" "$TEMP_SWAP_FILE"
+    else
+        dd if=/dev/zero of="$TEMP_SWAP_FILE" bs=1M count="$SWAP_SIZE_MB" status=none
+    fi
+    mkswap "$TEMP_SWAP_FILE" >/dev/null
+    swapon "$TEMP_SWAP_FILE"
+    TEMP_SWAP_ACTIVE=1
+    log "Enabled ${SWAP_SIZE_MB} MiB temporary build swap: $TEMP_SWAP_FILE"
+}
+
+prepare_temporary_swap
 install -d -m 0750 -o "$PG_USER" -g "$(id -gn "$PG_USER")" \
     "$INSTALL_PREFIX" "$SQLITE_PREFIX"
 
@@ -669,8 +773,7 @@ if ((USE_SYSTEM_GEOS == 0)); then
     extract geos
     cmake -S "${SOURCE_DIRS[geos]}" -B "${SOURCE_DIRS[geos]}/build" \
         -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
-    cmake --build "${SOURCE_DIRS[geos]}/build" --parallel "$JOBS"
-    cmake --install "${SOURCE_DIRS[geos]}/build"
+    cmake_build_install "GEOS" "${SOURCE_DIRS[geos]}/build"
 fi
 
 if ((USE_SYSTEM_PROJ == 0)); then
@@ -723,8 +826,7 @@ if ((USE_SYSTEM_SFCGAL == 0)); then
         -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
         -DCMAKE_INSTALL_RPATH="$INSTALL_PREFIX/lib64;$INSTALL_PREFIX/lib"
-    cmake --build "${SOURCE_DIRS[cgal]}/build" --parallel "$JOBS"
-    cmake --install "${SOURCE_DIRS[cgal]}/build"
+    cmake_build_install "CGAL" "${SOURCE_DIRS[cgal]}/build"
 
     log "Building SFCGAL"
     CGAL_DIR="$(
@@ -746,8 +848,7 @@ if ((USE_SYSTEM_SFCGAL == 0)); then
         -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX;$SQLITE_PREFIX" \
         -DCGAL_DIR="$CGAL_DIR" \
         -DCMAKE_INSTALL_RPATH="$INSTALL_PREFIX/lib64;$INSTALL_PREFIX/lib"
-    cmake --build "${SOURCE_DIRS[sfcgal]}/build" --parallel "$JOBS"
-    cmake --install "${SOURCE_DIRS[sfcgal]}/build"
+    cmake_build_install "SFCGAL" "${SOURCE_DIRS[sfcgal]}/build"
 fi
 
 if ((USE_SYSTEM_PCRE == 0)); then
