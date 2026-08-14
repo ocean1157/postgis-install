@@ -217,9 +217,9 @@ find_pg_config() {
 
 find_pg_config || die "PostgreSQL pg_config not found. Set PG_CONFIG or use --pg-config."
 readonly PG_CONFIG
-PG_CONFIG_PREFIX="$("$PG_CONFIG" --prefix)"
+PG_CONFIG_PREFIX="$(dirname -- "$("$PG_CONFIG" --bindir)")"
 [[ -d "$PG_CONFIG_PREFIX" ]] ||
-    die "Selected pg_config returned a missing PostgreSQL prefix: $PG_CONFIG_PREFIX"
+    die "Cannot derive an existing PostgreSQL prefix from pg_config --bindir: $PG_CONFIG_PREFIX"
 if ((PGHOME_EXPLICIT)); then
     [[ "$(readlink -f "$PGHOME")" == "$(readlink -f "$PG_CONFIG_PREFIX")" ]] ||
         die "Specified PGHOME ($PGHOME) does not match pg_config prefix ($PG_CONFIG_PREFIX)"
